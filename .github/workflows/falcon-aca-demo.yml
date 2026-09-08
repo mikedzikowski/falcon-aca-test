@@ -81,7 +81,7 @@ jobs:
     timeout-minutes: 45
 
     outputs:
-      patched-image-ref: ${{ steps.patch-image.outputs.ref }}
+      patched-image-ref: ${{ steps.vars.outputs.prod_patched }}
       patched-image-digest: ${{ steps.patch-image.outputs.digest }}
       # NOTE: passed/exit-code are written by the fcs-summary step (it parses the
       # scan JSON), NOT by the fcs-scan action — wiring these to steps.fcs-scan.*
@@ -127,7 +127,12 @@ jobs:
           echo "registry=${REGISTRY}"                                        >> $GITHUB_OUTPUT
           echo "tag=${TAG}"                                                  >> $GITHUB_OUTPUT
           echo "base_image=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}"         >> $GITHUB_OUTPUT
-          echo "patched_image=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}-patched" >> $GITHUB_OUTPUT
+          # Staging (quarantine) tag: the patched image is published HERE first so
+          # Falcon can run full registry assessment (incl. malware cloud detection,
+          # which does NOT run on a local-only scan). Promoted to the prod tag only
+          # if the gate passes; deleted from staging if it fails.
+          echo "staging_patched=${REGISTRY}/${{ env.IMAGE_REPO }}-staging:${TAG}-patched" >> $GITHUB_OUTPUT
+          echo "prod_patched=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}-patched" >> $GITHUB_OUTPUT
           echo "sensor_image=${REGISTRY}/falcon-container:${TAG}"            >> $GITHUB_OUTPUT
 
           echo "### 🎬 Demo scenario: \`${SCENARIO}\`" >> $GITHUB_STEP_SUMMARY
@@ -211,15 +216,15 @@ jobs:
           docker push "${{ steps.vars.outputs.sensor_image }}"
           echo "sensor-ref=${{ steps.vars.outputs.sensor_image }}" >> $GITHUB_OUTPUT
 
-      - name: Patch image with Falcon sensor
+      - name: Patch image with Falcon sensor, publish to STAGING
         id: patch-image
         run: |
           set -euo pipefail
           BASE_IMAGE="${{ steps.vars.outputs.base_image }}"
           SENSOR_IMAGE="${{ steps.vars.outputs.sensor_image }}"
-          TARGET_IMAGE="${{ steps.vars.outputs.patched_image }}"
+          TARGET_IMAGE="${{ steps.vars.outputs.staging_patched }}"
 
-          echo "Patching ${BASE_IMAGE} with sensor ${SENSOR_IMAGE}..."
+          echo "Patching ${BASE_IMAGE} with sensor ${SENSOR_IMAGE} -> ${TARGET_IMAGE} (staging)..."
           # falconutil injects the sensor and stamps ACA attribution metadata
           # (--subscription/--resource-group/--cloud-service) into the image.
           # VERIFY - falconutil flags not confirmed via CrowdStrike MCP
@@ -237,6 +242,13 @@ jobs:
             --cid "${{ secrets.FALCON_CID }}")
           echo "$PATCH_OUTPUT"
 
+          # Publish the patched image to the STAGING repo so Falcon can run a full
+          # registry assessment (malware cloud detection does not run on a local-only
+          # scan). This is a quarantine location — the deployable repo is untouched
+          # until the gate passes and we promote.
+          echo "Publishing patched image to staging: ${TARGET_IMAGE}"
+          docker push "${TARGET_IMAGE}"
+
           PATCHED_DIGEST=$(echo "$PATCH_OUTPUT" | grep -E "writing image" | awk '{print $4}' || echo "")
           if [ -z "$PATCHED_DIGEST" ]; then
             echo "::warning::Could not parse digest from patch output; resolving from ACR..."
@@ -248,18 +260,18 @@ jobs:
       - name: CrowdStrike Image Scan (policy gate)
         uses: crowdstrike/fcs-action@01930f3d7eb5a9ded52e558abf56452f1bc5b46d # v5.0.3
         id: fcs-scan
-        # Scans the LOCAL patched image straight from the runner's Docker daemon
-        # (socket) — nothing has been pushed to any registry yet. v5's local scan
-        # performs the full assessment (vulnerabilities AND Falcon malware cloud
-        # detection) in-agent, so the gate can block before anything is published.
+        # Scans the patched image in the STAGING repo (registry assessment). A local
+        # (socket) scan returns vulnerabilities/CIS/misconfig but NOT Falcon malware
+        # cloud detection — verified on both v2.0.2 and v5.0.3 — so the image must be
+        # in a registry for the gate to catch malware. Staging is a quarantine repo;
+        # the deployable repo is untouched until we promote on pass.
         # For image scans the exit code reflects the Falcon console image-assessment
-        # POLICY verdict; the explicit gate step below acts on it.
+        # POLICY verdict; the explicit gate steps below act on it.
         with:
           falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
           falcon_region: ${{ inputs.falconRegion || 'us-1' }}
           scan_type: 'image'
           image: ${{ steps.patch-image.outputs.ref }}
-          socket: 'unix:///var/run/docker.sock'
           minimum_exprt: 'critical'
           report_formats: 'json'
           output_path: './scan-image.json'
@@ -321,24 +333,39 @@ jobs:
             fcs-summary.md
           retention-days: 30
 
-      - name: Fail on image-assessment policy violation
-        if: ${{ inputs.failOnPolicyViolation && steps.fcs-summary.outputs.exit-code != '0' }}
+      - name: Gate BLOCKED — delete staging image, fail build
+        # On a policy denial the quarantined image is removed from staging and the
+        # build fails. It is NEVER promoted to the deployable repo.
+        if: ${{ steps.fcs-summary.outputs.exit-code != '0' }}
         run: |
-          echo "::error::Falcon image-assessment policy denied this image (exit ${{ steps.fcs-summary.outputs.exit-code }}). Scenario='${{ steps.vars.outputs.scenario }}'. Nothing was pushed to ACR. Remediate the finding (or run scenario=clean) to clear the gate."
-          exit 1
+          set -euo pipefail
+          STAGING="${{ steps.vars.outputs.staging_patched }}"
+          # strip registry host -> "repo:tag" for az acr delete
+          IMG="${STAGING#*/}"
+          echo "Gate denied — deleting quarantined image ${IMG} from ACR..."
+          az acr repository delete --name ${{ vars.ACR_NAME }} --image "${IMG}" --yes 2>/dev/null || echo "(nothing to delete)"
+          if [ "${{ inputs.failOnPolicyViolation }}" = "true" ]; then
+            echo "::error::Falcon image-assessment policy denied this image (exit ${{ steps.fcs-summary.outputs.exit-code }}), scenario='${{ steps.vars.outputs.scenario }}'. Quarantine deleted; nothing promoted. Remediate (or run scenario=clean) to clear the gate."
+            exit 1
+          fi
+          echo "::warning::Policy denied but failOnPolicyViolation=false; not failing the build. Image was NOT promoted."
 
-      - name: Push patched image to ACR (ONLY after gate passes)
-        # The workload image reaches the registry only here — after it was built,
-        # patched, scanned locally, and PASSED the image-assessment gate. A blocked
-        # scan fails the step above and this never runs, so a bad image never lands
-        # in ACR. The Falcon sensor image was pushed earlier (trusted CrowdStrike
-        # image, required for the ACA runtime pull).
+      - name: Gate PASSED — promote staging → deployable repo
+        # Only a passed image is promoted to the deployable repo/tag. Staging is
+        # then cleaned up. The deployable repo only ever holds gated images.
         if: ${{ steps.fcs-summary.outputs.exit-code == '0' }}
         run: |
           set -euo pipefail
-          echo "Gate passed — publishing patched image to ACR..."
-          docker push "${{ steps.patch-image.outputs.ref }}"
-          echo "Published: ${{ steps.patch-image.outputs.ref }}"
+          STAGING="${{ steps.vars.outputs.staging_patched }}"
+          PROD="${{ steps.vars.outputs.prod_patched }}"
+          echo "Gate passed — promoting ${STAGING} -> ${PROD}"
+          # The patched image is still in the runner's local daemon (we built it here),
+          # so retag + push to the deployable repo — no pull needed.
+          docker tag "${STAGING}" "${PROD}"
+          docker push "${PROD}"
+          echo "Promoted to deployable repo: ${PROD}"
+          echo "Cleaning up staging tag..."
+          az acr repository delete --name ${{ vars.ACR_NAME }} --image "${STAGING#*/}" --yes 2>/dev/null || echo "(staging already gone)"
 
   deploy:
     name: Deploy to Azure Container Apps
