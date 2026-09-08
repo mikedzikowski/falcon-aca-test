@@ -86,7 +86,8 @@ jobs:
       # NOTE: passed/exit-code are written by the fcs-summary step (it parses the
       # scan JSON), NOT by the fcs-scan action — wiring these to steps.fcs-scan.*
       # silently yields "" and the deploy gate never matches.
-      scan-passed: ${{ steps.fcs-summary.outputs.passed }}
+      # Combined gate: image-assessment policy (vuln/malware) AND IaC secret scan.
+      scan-passed: ${{ steps.gate.outputs.passed }}
       scan-exit-code: ${{ steps.fcs-summary.outputs.exit-code }}
       scenario: ${{ steps.vars.outputs.scenario }}
 
@@ -94,7 +95,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: CrowdStrike IaC Scan (shift-left, non-blocking)
+      - name: Plant hardcoded secret (secret scenario only)
+        # Secrets in a container image are NOT detected by Falcon image assessment
+        # (image scanning has no secret engine). Secret detection is an IaC-scan
+        # feature, so for this scenario we drop a hardcoded credential into a repo
+        # file at runtime; the IaC scan below flags it and the gate blocks.
+        if: ${{ (inputs.demoScenario || 'clean') == 'secret' }}
+        run: |
+          set -euo pipefail
+          mkdir -p demo-secret
+          cat > demo-secret/leaked.tf <<'TF'
+          # DEMO: intentionally hardcoded credentials (non-functional AWS example key).
+          provider "aws" {
+            access_key = "AKIAIOSFODNN7EXAMPLE"
+            secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            region     = "us-east-1"
+          }
+          TF
+          echo "Planted demo-secret/leaked.tf for IaC secret detection."
+
+      - name: CrowdStrike IaC Scan (secrets + misconfig)
         uses: crowdstrike/fcs-action@v2.0.2
         id: fcs-iac
         continue-on-error: true
@@ -333,34 +353,69 @@ jobs:
             fcs-summary.md
           retention-days: 30
 
+      - name: Evaluate combined gate (image policy + IaC secrets)
+        id: gate
+        run: |
+          set -euo pipefail
+          IMG_EXIT="${{ steps.fcs-summary.outputs.exit-code }}"
+          SCENARIO="${{ steps.vars.outputs.scenario }}"
+          BLOCKED=0
+          REASON=""
+
+          # (1) Image-assessment policy verdict (vulnerability / malware)
+          if [ "${IMG_EXIT:-0}" != "0" ]; then
+            BLOCKED=1; REASON="image-assessment policy (exit ${IMG_EXIT})"
+          fi
+
+          # (2) IaC secret detection — secrets are an IaC-scan feature, not image
+          # assessment. Any secret/credential-category finding blocks the build.
+          if [ -f scan-iac.json ]; then
+            echo "IaC detections:"
+            jq -r '.rule_detections[]? | "  [\(.severity)] \(.rule_category) :: \(.rule_name)"' scan-iac.json || true
+            SECRETS=$(jq '[.rule_detections[]?
+              | select((((.rule_category // "")|ascii_downcase)|test("secret|password|credential|key"))
+                    or (((.rule_name // "")|ascii_downcase)|test("secret|password|credential|access key|hardcoded")))]
+              | length' scan-iac.json 2>/dev/null || echo 0)
+            echo "IaC secret/credential findings: ${SECRETS}"
+            if [ "${SECRETS:-0}" -gt 0 ]; then
+              BLOCKED=1
+              REASON="${REASON:+$REASON; }IaC secret detection (${SECRETS} finding(s))"
+            fi
+          fi
+
+          if [ "$BLOCKED" = "1" ]; then
+            echo "passed=false" >> $GITHUB_OUTPUT
+          else
+            echo "passed=true" >> $GITHUB_OUTPUT
+          fi
+          echo "reason=${REASON:-none}" >> $GITHUB_OUTPUT
+          echo "Combined gate -> passed=$([ "$BLOCKED" = "1" ] && echo false || echo true) | reason=${REASON:-none}"
+
       - name: Gate BLOCKED — delete staging image, fail build
-        # On a policy denial the quarantined image is removed from staging and the
-        # build fails. It is NEVER promoted to the deployable repo.
-        if: ${{ steps.fcs-summary.outputs.exit-code != '0' }}
+        # On any gate denial (image policy OR IaC secret) the quarantined image is
+        # removed from staging and the build fails. It is NEVER promoted.
+        if: ${{ steps.gate.outputs.passed == 'false' }}
         run: |
           set -euo pipefail
           STAGING="${{ steps.vars.outputs.staging_patched }}"
-          # strip registry host -> "repo:tag" for az acr delete
           IMG="${STAGING#*/}"
-          echo "Gate denied — deleting quarantined image ${IMG} from ACR..."
+          echo "Gate denied (${{ steps.gate.outputs.reason }}) — deleting quarantined image ${IMG}..."
           az acr repository delete --name ${{ vars.ACR_NAME }} --image "${IMG}" --yes 2>/dev/null || echo "(nothing to delete)"
           if [ "${{ inputs.failOnPolicyViolation }}" = "true" ]; then
-            echo "::error::Falcon image-assessment policy denied this image (exit ${{ steps.fcs-summary.outputs.exit-code }}), scenario='${{ steps.vars.outputs.scenario }}'. Quarantine deleted; nothing promoted. Remediate (or run scenario=clean) to clear the gate."
+            echo "::error::Gate denied: ${{ steps.gate.outputs.reason }} (scenario='${{ steps.vars.outputs.scenario }}'). Quarantine deleted; nothing promoted. Remediate (or run scenario=clean) to clear the gate."
             exit 1
           fi
-          echo "::warning::Policy denied but failOnPolicyViolation=false; not failing the build. Image was NOT promoted."
+          echo "::warning::Gate denied but failOnPolicyViolation=false; not failing. Image was NOT promoted."
 
       - name: Gate PASSED — promote staging → deployable repo
         # Only a passed image is promoted to the deployable repo/tag. Staging is
         # then cleaned up. The deployable repo only ever holds gated images.
-        if: ${{ steps.fcs-summary.outputs.exit-code == '0' }}
+        if: ${{ steps.gate.outputs.passed == 'true' }}
         run: |
           set -euo pipefail
           STAGING="${{ steps.vars.outputs.staging_patched }}"
           PROD="${{ steps.vars.outputs.prod_patched }}"
           echo "Gate passed — promoting ${STAGING} -> ${PROD}"
-          # The patched image is still in the runner's local daemon (we built it here),
-          # so retag + push to the deployable repo — no pull needed.
           docker tag "${STAGING}" "${PROD}"
           docker push "${PROD}"
           echo "Promoted to deployable repo: ${PROD}"
