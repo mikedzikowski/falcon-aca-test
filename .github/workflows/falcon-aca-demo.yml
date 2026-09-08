@@ -104,18 +104,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p demo-secret
+          # NON-allowlisted fake credentials (the AWS *docs* example key
+          # AKIAIOSFODNN7EXAMPLE is deliberately ignored by secret scanners, so we
+          # use realistic-looking but bogus values that still match secret patterns).
           cat > demo-secret/leaked.tf <<'TF'
-          # DEMO: intentionally hardcoded credentials (non-functional AWS example key).
+          # DEMO: intentionally hardcoded credentials (bogus, non-functional).
           provider "aws" {
-            access_key = "AKIAIOSFODNN7EXAMPLE"
-            secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            access_key = "AKIA2E0A8F3B7C9D1X5Z"
+            secret_key = "kR8fJ2pQ7mN4vB6xW1yT3zL5cH9dG0aS2eU4iO6p"
             region     = "us-east-1"
+          }
+
+          variable "db_password" {
+            default = "P@ssw0rd-Pr0d-9f3a1c7e-do-not-commit"
           }
           TF
           echo "Planted demo-secret/leaked.tf for IaC secret detection."
 
       - name: CrowdStrike IaC Scan (secrets + misconfig)
-        uses: crowdstrike/fcs-action@v2.0.2
+        uses: crowdstrike/fcs-action@01930f3d7eb5a9ded52e558abf56452f1bc5b46d # v5.0.3
         id: fcs-iac
         continue-on-error: true
         with:
@@ -123,6 +130,7 @@ jobs:
           falcon_region: ${{ inputs.falconRegion || 'us-1' }}
           scan_type: 'iac'
           path: './'
+          disable_secrets_scan: false
           report_formats: 'json'
           output_path: './scan-iac.json'
           upload_results: true
