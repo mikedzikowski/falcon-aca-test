@@ -67,8 +67,11 @@ jobs:
     outputs:
       patched-image-ref: ${{ steps.patch-image.outputs.ref }}
       patched-image-digest: ${{ steps.patch-image.outputs.digest }}
-      scan-passed: ${{ steps.fcs-scan.outputs.passed }}
-      scan-exit-code: ${{ steps.fcs-scan.outputs.exit-code }}
+      # NOTE: `passed`/`exit-code` are written by the fcs-summary step (which
+      # parses the scan JSON), NOT by the fcs-scan action. Pointing these at
+      # steps.fcs-scan.* silently yields "" so the deploy gate never matches.
+      scan-passed: ${{ steps.fcs-summary.outputs.passed }}
+      scan-exit-code: ${{ steps.fcs-summary.outputs.exit-code }}
 
     steps:
       - name: Checkout repository
