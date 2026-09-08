@@ -169,21 +169,19 @@ jobs:
           SCENARIO="${{ steps.vars.outputs.scenario }}"
           BASE_IMAGE="${{ steps.vars.outputs.base_image }}"
 
+          # SECURITY: build/pull the workload image LOCALLY only. It is NOT pushed
+          # to ACR here — nothing reaches the registry until it has been patched,
+          # scanned, and has PASSED the image-assessment gate (see the push step
+          # after the gate). falconutil patches the local image (IfNotPresent).
           if [ "$SCENARIO" = "malware" ]; then
-            # Pull a purpose-built known-malware test image (real samples detect
-            # far more reliably than the EICAR string). Never deployed — the gate
-            # blocks it — so its non-:80 port doesn't matter.
             echo "Pulling known-malware test image: ${MALWARE_SOURCE_IMAGE}"
             docker pull "${MALWARE_SOURCE_IMAGE}"
             docker tag "${MALWARE_SOURCE_IMAGE}" "${BASE_IMAGE}"
           else
-            # clean | vulnerability | secret -> build from our parameterized Dockerfile.
-            echo "Building scenario '${SCENARIO}' from Dockerfile..."
+            echo "Building scenario '${SCENARIO}' from Dockerfile (local only)..."
             docker build --build-arg "SCENARIO=${SCENARIO}" -t "${BASE_IMAGE}" .
           fi
-
-          echo "Pushing source image to ACR: ${BASE_IMAGE}"
-          docker push "${BASE_IMAGE}"
+          echo "Source image staged locally (NOT pushed): ${BASE_IMAGE}"
         timeout-minutes: 10
 
       - name: Pull Falcon Container Sensor
@@ -323,8 +321,21 @@ jobs:
       - name: Fail on image-assessment policy violation
         if: ${{ inputs.failOnPolicyViolation && steps.fcs-summary.outputs.exit-code != '0' }}
         run: |
-          echo "::error::Falcon image-assessment policy denied this image (exit ${{ steps.fcs-summary.outputs.exit-code }}). Scenario='${{ steps.vars.outputs.scenario }}'. Remediate the finding (or run scenario=clean) to clear the gate."
+          echo "::error::Falcon image-assessment policy denied this image (exit ${{ steps.fcs-summary.outputs.exit-code }}). Scenario='${{ steps.vars.outputs.scenario }}'. Nothing was pushed to ACR. Remediate the finding (or run scenario=clean) to clear the gate."
           exit 1
+
+      - name: Push patched image to ACR (ONLY after gate passes)
+        # The workload image reaches the registry only here — after it was built,
+        # patched, scanned locally, and PASSED the image-assessment gate. A blocked
+        # scan fails the step above and this never runs, so a bad image never lands
+        # in ACR. The Falcon sensor image was pushed earlier (trusted CrowdStrike
+        # image, required for the ACA runtime pull).
+        if: ${{ steps.fcs-summary.outputs.exit-code == '0' }}
+        run: |
+          set -euo pipefail
+          echo "Gate passed — publishing patched image to ACR..."
+          docker push "${{ steps.patch-image.outputs.ref }}"
+          echo "Published: ${{ steps.patch-image.outputs.ref }}"
 
   deploy:
     name: Deploy to Azure Container Apps
