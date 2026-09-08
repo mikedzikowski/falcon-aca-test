@@ -491,9 +491,10 @@ jobs:
           imageToDeploy: ${{ needs.build-scan-and-gate.outputs.patched-image-ref }}
           targetPort: 80
           ingress: external
-          environmentVariables: |
-            PORT=80
-            ADDITIONAL_PORT=8080
+          # NOTE: do NOT set environmentVariables here — the action passes it as
+          # `--replace-env-vars`, which is an UPDATE-only flag and is rejected by
+          # `az containerapp create` on first deploy (exit code 2). nginx needs no
+          # env vars anyway; set them via a later `az containerapp update` if required.
 
       - name: Deployment summary
         run: |
