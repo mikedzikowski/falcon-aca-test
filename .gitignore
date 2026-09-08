@@ -1,0 +1,25 @@
+# .gitignore for Falcon Container Apps Demo
+
+# Ignore the example Azure DevOps pipeline
+example.yml
+
+# GitHub Actions artifacts
+*.json
+*.md.tmp
+
+# Docker build artifacts
+.dockerignore
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
