@@ -29,7 +29,6 @@ on:
           - 'clean'
           - 'vulnerability'
           - 'malware'
-          - 'secret'
       runFCSScan:
         type: boolean
         default: true
@@ -95,33 +94,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Plant hardcoded secret (secret scenario only)
-        # Secrets in a container image are NOT detected by Falcon image assessment
-        # (image scanning has no secret engine). Secret detection is an IaC-scan
-        # feature, so for this scenario we drop a hardcoded credential into a repo
-        # file at runtime; the IaC scan below flags it and the gate blocks.
-        if: ${{ (inputs.demoScenario || 'clean') == 'secret' }}
-        run: |
-          set -euo pipefail
-          mkdir -p demo-secret
-          # NON-allowlisted fake credentials (the AWS *docs* example key
-          # AKIAIOSFODNN7EXAMPLE is deliberately ignored by secret scanners, so we
-          # use realistic-looking but bogus values that still match secret patterns).
-          cat > demo-secret/leaked.tf <<'TF'
-          # DEMO: intentionally hardcoded credentials (bogus, non-functional).
-          provider "aws" {
-            access_key = "AKIA2E0A8F3B7C9D1X5Z"
-            secret_key = "kR8fJ2pQ7mN4vB6xW1yT3zL5cH9dG0aS2eU4iO6p"
-            region     = "us-east-1"
-          }
-
-          variable "db_password" {
-            default = "P@ssw0rd-Pr0d-9f3a1c7e-do-not-commit"
-          }
-          TF
-          echo "Planted demo-secret/leaked.tf for IaC secret detection."
-
-      - name: CrowdStrike IaC Scan (secrets + misconfig)
+      - name: CrowdStrike IaC Scan (shift-left, non-blocking)
         uses: crowdstrike/fcs-action@01930f3d7eb5a9ded52e558abf56452f1bc5b46d # v5.0.3
         id: fcs-iac
         continue-on-error: true
@@ -130,7 +103,6 @@ jobs:
           falcon_region: ${{ inputs.falconRegion || 'us-1' }}
           scan_type: 'iac'
           path: './'
-          disable_secrets_scan: false
           report_formats: 'json'
           output_path: './scan-iac.json'
           upload_results: true
@@ -361,43 +333,20 @@ jobs:
             fcs-summary.md
           retention-days: 30
 
-      - name: Evaluate combined gate (image policy + IaC secrets)
+      - name: Evaluate gate (image-assessment policy)
         id: gate
         run: |
           set -euo pipefail
           IMG_EXIT="${{ steps.fcs-summary.outputs.exit-code }}"
-          SCENARIO="${{ steps.vars.outputs.scenario }}"
-          BLOCKED=0
-          REASON=""
-
-          # (1) Image-assessment policy verdict (vulnerability / malware)
-          if [ "${IMG_EXIT:-0}" != "0" ]; then
-            BLOCKED=1; REASON="image-assessment policy (exit ${IMG_EXIT})"
-          fi
-
-          # (2) IaC secret detection — secrets are an IaC-scan feature, not image
-          # assessment. Any secret/credential-category finding blocks the build.
-          if [ -f scan-iac.json ]; then
-            echo "IaC detections:"
-            jq -r '.rule_detections[]? | "  [\(.severity)] \(.rule_category) :: \(.rule_name)"' scan-iac.json || true
-            SECRETS=$(jq '[.rule_detections[]?
-              | select((((.rule_category // "")|ascii_downcase)|test("secret|password|credential|key"))
-                    or (((.rule_name // "")|ascii_downcase)|test("secret|password|credential|access key|hardcoded")))]
-              | length' scan-iac.json 2>/dev/null || echo 0)
-            echo "IaC secret/credential findings: ${SECRETS}"
-            if [ "${SECRETS:-0}" -gt 0 ]; then
-              BLOCKED=1
-              REASON="${REASON:+$REASON; }IaC secret detection (${SECRETS} finding(s))"
-            fi
-          fi
-
-          if [ "$BLOCKED" = "1" ]; then
-            echo "passed=false" >> $GITHUB_OUTPUT
-          else
+          # The image-assessment policy verdict (vulnerability / malware) drives the
+          # gate. exit 0 = passed; non-zero = denied.
+          if [ "${IMG_EXIT:-0}" = "0" ]; then
             echo "passed=true" >> $GITHUB_OUTPUT
+            echo "Gate PASSED (image-assessment exit ${IMG_EXIT:-0})"
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "Gate DENIED (image-assessment exit ${IMG_EXIT})"
           fi
-          echo "reason=${REASON:-none}" >> $GITHUB_OUTPUT
-          echo "Combined gate -> passed=$([ "$BLOCKED" = "1" ] && echo false || echo true) | reason=${REASON:-none}"
 
       - name: Gate BLOCKED — delete staging image, fail build
         # On any gate denial (image policy OR IaC secret) the quarantined image is
@@ -410,7 +359,7 @@ jobs:
           echo "Gate denied (${{ steps.gate.outputs.reason }}) — deleting quarantined image ${IMG}..."
           az acr repository delete --name ${{ vars.ACR_NAME }} --image "${IMG}" --yes 2>/dev/null || echo "(nothing to delete)"
           if [ "${{ inputs.failOnPolicyViolation }}" = "true" ]; then
-            echo "::error::Gate denied: ${{ steps.gate.outputs.reason }} (scenario='${{ steps.vars.outputs.scenario }}'). Quarantine deleted; nothing promoted. Remediate (or run scenario=clean) to clear the gate."
+            echo "::error::Image-assessment policy denied this image (exit ${{ steps.fcs-summary.outputs.exit-code }}, scenario='${{ steps.vars.outputs.scenario }}'). Quarantine deleted; nothing promoted. Remediate (or run scenario=clean) to clear the gate."
             exit 1
           fi
           echo "::warning::Gate denied but failOnPolicyViolation=false; not failing. Image was NOT promoted."
