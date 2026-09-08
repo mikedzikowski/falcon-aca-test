@@ -246,20 +246,23 @@ jobs:
           echo "ref=${TARGET_IMAGE}" >> $GITHUB_OUTPUT
 
       - name: CrowdStrike Image Scan (policy gate)
-        uses: crowdstrike/fcs-action@v2.0.2
+        uses: crowdstrike/fcs-action@01930f3d7eb5a9ded52e558abf56452f1bc5b46d # v5.0.3
         id: fcs-scan
+        # Scans the LOCAL patched image straight from the runner's Docker daemon
+        # (socket) — nothing has been pushed to any registry yet. v5's local scan
+        # performs the full assessment (vulnerabilities AND Falcon malware cloud
+        # detection) in-agent, so the gate can block before anything is published.
         # For image scans the exit code reflects the Falcon console image-assessment
-        # POLICY verdict (not the minimum_exprt flag). The action sets exit-code;
-        # the explicit gate step below acts on it.
+        # POLICY verdict; the explicit gate step below acts on it.
         with:
           falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
           falcon_region: ${{ inputs.falconRegion || 'us-1' }}
           scan_type: 'image'
           image: ${{ steps.patch-image.outputs.ref }}
+          socket: 'unix:///var/run/docker.sock'
           minimum_exprt: 'critical'
           report_formats: 'json'
           output_path: './scan-image.json'
-          show_full_description: false
           upload_results: true
           no_color: true
         env:
