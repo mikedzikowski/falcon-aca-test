@@ -1,28 +1,43 @@
 # falcon-aca-demo.yml
-# Purpose: GitHub Actions workflow to patch container images with CrowdStrike Falcon Container Security and deploy to Azure Container Apps
-# Migration from Azure DevOps pipeline with improved security, reliability, and regional support
+# GitHub Actions workflow: patch a container image with the CrowdStrike Falcon
+# Container sensor, gate it against a Falcon image-assessment POLICY, and deploy
+# the patched image to Azure Container Apps on success.
+#
+# DEMO KNOB: `demoScenario` selects which (if any) defect is baked into the
+# workload image so you can show the image-assessment gate blocking each
+# detection type, then flip to `clean` to show it pass and deploy.
+#
+#   clean         -> healthy app            -> gate PASSES  -> deploys to ACA
+#   vulnerability -> aiohttp==3.9.1          -> CVE-2024-23334 -> gate BLOCKS
+#   malware       -> pull known-malware img  -> malware detection -> gate BLOCKS
+#   secret        -> hardcoded AWS/PEM creds  -> secret detection  -> gate BLOCKS
+#
+# The gate itself lives in the Falcon console (image-assessment policy
+# "mikedz-aca-demo-gate", scoped to this repo). The fcs-action image-scan exit
+# code reflects that policy's verdict — that is what fails the build.
 
 name: Build and Deploy Falcon Container Apps
 
 on:
   workflow_dispatch:
     inputs:
-      useDockerfile:
-        type: boolean
-        default: false
-        description: 'Build from Dockerfile instead of mirroring nginx:latest'
-      dockerfilePath:
-        type: string
-        default: './Dockerfile'
-        description: 'Path to Dockerfile (if useDockerfile is true)'
+      demoScenario:
+        type: choice
+        default: 'clean'
+        description: 'Which defect to bake into the image (drives the gate demo)'
+        options:
+          - 'clean'
+          - 'vulnerability'
+          - 'malware'
+          - 'secret'
       runFCSScan:
         type: boolean
         default: true
         description: 'Run Falcon Container Security scan on patched image'
       deployToACA:
         type: boolean
-        default: false
-        description: 'Deploy patched image to Azure Container Apps'
+        default: true
+        description: 'Deploy patched image to Azure Container Apps (only if gate passes)'
       falconRegion:
         type: choice
         default: 'us-1'
@@ -36,27 +51,28 @@ on:
       failOnPolicyViolation:
         type: boolean
         default: true
-        description: 'Fail deployment if FCS policy violations are found'
+        description: 'Fail the build if the image-assessment policy denies the image'
   push:
     branches: [main]
   schedule:
-    # Run daily at 2:17 AM UTC (off-minute to spread load across CrowdStrike's infrastructure)
+    # Daily (not hourly) at an off-minute to avoid the top-of-hour API stampede
+    # and keep cost/noise down for a demo repo.
     - cron: '17 2 * * *'
 
-# Prevent overlapping deploys on the same ref
 concurrency:
   group: falcon-aca-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  id-token: write    # Required for Azure OIDC authentication
-  contents: read     # Required to checkout repository
+  id-token: write    # Azure OIDC
+  contents: read
 
 env:
-  # Container image configuration - immutable tags based on commit SHA
-  SHORT_SHA: ${{ github.sha }}
-  BASE_IMAGE_TAG: myapp:${{ github.sha }}
-  PATCHED_IMAGE_TAG: myapp:${{ github.sha }}-patched
+  # Unique repo name so the scoped image-assessment policy can't collide with
+  # any other image on the shared demo tenant.
+  IMAGE_REPO: mikedz-falcon-aca
+  # Public known-malware test image (nginx-based; WannaCry/Mirai/XMRig samples).
+  MALWARE_SOURCE_IMAGE: quay.io/petr_ruzicka/malware-cryptominer-container:3
 
 jobs:
   build-scan-and-gate:
@@ -67,11 +83,12 @@ jobs:
     outputs:
       patched-image-ref: ${{ steps.patch-image.outputs.ref }}
       patched-image-digest: ${{ steps.patch-image.outputs.digest }}
-      # NOTE: `passed`/`exit-code` are written by the fcs-summary step (which
-      # parses the scan JSON), NOT by the fcs-scan action. Pointing these at
-      # steps.fcs-scan.* silently yields "" so the deploy gate never matches.
+      # NOTE: passed/exit-code are written by the fcs-summary step (it parses the
+      # scan JSON), NOT by the fcs-scan action — wiring these to steps.fcs-scan.*
+      # silently yields "" and the deploy gate never matches.
       scan-passed: ${{ steps.fcs-summary.outputs.passed }}
       scan-exit-code: ${{ steps.fcs-summary.outputs.exit-code }}
+      scenario: ${{ steps.vars.outputs.scenario }}
 
     steps:
       - name: Checkout repository
@@ -83,12 +100,9 @@ jobs:
         continue-on-error: true
         with:
           falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
-          falcon_region: ${{ inputs.falconRegion }}
+          falcon_region: ${{ inputs.falconRegion || 'us-1' }}
           scan_type: 'iac'
           path: './'
-          # Report only — surface findings but DO NOT gate the build.
-          # This demonstrates shift-left scanning of any Dockerfiles,
-          # CI configs, or infrastructure code in the repository.
           report_formats: 'json'
           output_path: './scan-iac.json'
           upload_results: true
@@ -104,50 +118,35 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Default scenario/region so push & schedule triggers (no inputs) still work.
+          SCENARIO="${{ inputs.demoScenario || 'clean' }}"
           REGISTRY="${{ vars.ACR_NAME }}.azurecr.io"
           TAG=$(echo "$GITHUB_SHA" | cut -c1-8)
 
-          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "base_image=${REGISTRY}/${{ env.BASE_IMAGE_TAG }}" >> $GITHUB_OUTPUT
-          echo "patched_image=${REGISTRY}/${{ env.PATCHED_IMAGE_TAG }}" >> $GITHUB_OUTPUT
-          echo "sensor_image=${REGISTRY}/falcon-container:${TAG}" >> $GITHUB_OUTPUT
+          echo "scenario=${SCENARIO}"                                        >> $GITHUB_OUTPUT
+          echo "registry=${REGISTRY}"                                        >> $GITHUB_OUTPUT
+          echo "tag=${TAG}"                                                  >> $GITHUB_OUTPUT
+          echo "base_image=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}"         >> $GITHUB_OUTPUT
+          echo "patched_image=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}-patched" >> $GITHUB_OUTPUT
+          echo "sensor_image=${REGISTRY}/falcon-container:${TAG}"            >> $GITHUB_OUTPUT
+
+          echo "### 🎬 Demo scenario: \`${SCENARIO}\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Set regional configuration
         id: region-config
         run: |
           set -euo pipefail
-
-          # VERIFY - could not confirm current API base URLs via CrowdStrike MCP
-          case "${{ inputs.falconRegion }}" in
-            "us-1")
-              API_BASE="https://api.crowdstrike.com"
-              FCS_REGISTRY="registry.crowdstrike.com/fcs/us-1/release"
-              ;;
-            "us-2")
-              API_BASE="https://api.us-2.crowdstrike.com"
-              FCS_REGISTRY="registry.crowdstrike.com/fcs/us-2/release"
-              ;;
-            "eu-1")
-              API_BASE="https://api.eu-1.crowdstrike.com"
-              FCS_REGISTRY="registry.crowdstrike.com/fcs/eu-1/release"
-              ;;
-            "us-gov-1")
-              API_BASE="https://api.laggar.gcw.crowdstrike.com"
-              FCS_REGISTRY="registry.laggar.gcw.crowdstrike.com/fcs/us-gov-1/release"
-              ;;
-            "us-gov-2")
-              API_BASE="https://api.alto.gcw.crowdstrike.com"
-              FCS_REGISTRY="registry.alto.gcw.crowdstrike.com/fcs/us-gov-2/release"
-              ;;
-            *)
-              echo "::error::Unsupported Falcon region: ${{ inputs.falconRegion }}"
-              exit 1
-              ;;
+          FALCON_REGION="${{ inputs.falconRegion || 'us-1' }}"
+          # VERIFY - API base URLs could not be confirmed via CrowdStrike MCP
+          case "$FALCON_REGION" in
+            "us-1")     API_BASE="https://api.crowdstrike.com" ;;
+            "us-2")     API_BASE="https://api.us-2.crowdstrike.com" ;;
+            "eu-1")     API_BASE="https://api.eu-1.crowdstrike.com" ;;
+            "us-gov-1") API_BASE="https://api.laggar.gcw.crowdstrike.com" ;;
+            "us-gov-2") API_BASE="https://api.alto.gcw.crowdstrike.com" ;;
+            *) echo "::error::Unsupported Falcon region: $FALCON_REGION"; exit 1 ;;
           esac
-
           echo "api-base=${API_BASE}" >> $GITHUB_OUTPUT
-          echo "fcs-registry=${FCS_REGISTRY}" >> $GITHUB_OUTPUT
 
       - name: Azure login via OIDC
         uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
@@ -159,89 +158,73 @@ jobs:
       - name: Login to Azure Container Registry
         run: |
           set -euo pipefail
-          # Use az acr login instead of docker login to avoid credential helper conflicts
+          # az acr login avoids the docker credential-helper conflict entirely.
           az acr login --name ${{ vars.ACR_NAME }}
         timeout-minutes: 2
 
-      - name: Build and push base image
-        if: ${{ inputs.useDockerfile }}
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: ${{ inputs.dockerfilePath }}
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.vars.outputs.base_image }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Mirror nginx image from Docker Hub to ACR
-        if: ${{ !inputs.useDockerfile }}
+      - name: Prepare source image (per scenario)
+        id: prepare-source
         run: |
           set -euo pipefail
+          SCENARIO="${{ steps.vars.outputs.scenario }}"
+          BASE_IMAGE="${{ steps.vars.outputs.base_image }}"
 
-          echo "Pulling nginx:latest from Docker Hub..."
-          docker pull nginx:latest
+          if [ "$SCENARIO" = "malware" ]; then
+            # Pull a purpose-built known-malware test image (real samples detect
+            # far more reliably than the EICAR string). Never deployed — the gate
+            # blocks it — so its non-:80 port doesn't matter.
+            echo "Pulling known-malware test image: ${MALWARE_SOURCE_IMAGE}"
+            docker pull "${MALWARE_SOURCE_IMAGE}"
+            docker tag "${MALWARE_SOURCE_IMAGE}" "${BASE_IMAGE}"
+          else
+            # clean | vulnerability | secret -> build from our parameterized Dockerfile.
+            echo "Building scenario '${SCENARIO}' from Dockerfile..."
+            docker build --build-arg "SCENARIO=${SCENARIO}" -t "${BASE_IMAGE}" .
+          fi
 
-          echo "Tagging for ACR..."
-          docker tag nginx:latest ${{ steps.vars.outputs.base_image }}
-
-          echo "Pushing to ACR..."
-          docker push ${{ steps.vars.outputs.base_image }}
-        timeout-minutes: 5
+          echo "Pushing source image to ACR: ${BASE_IMAGE}"
+          docker push "${BASE_IMAGE}"
+        timeout-minutes: 10
 
       - name: Pull Falcon Container Sensor
         id: pull-sensor
         run: |
           set -euo pipefail
-
           echo "Downloading falcon-container-sensor-pull.sh v1.13.0..."
           curl -fsSL -o falcon-pull.sh \
             "https://github.com/CrowdStrike/falcon-scripts/releases/download/v1.13.0/falcon-container-sensor-pull.sh"
           chmod +x falcon-pull.sh
 
-          echo "Pulling Falcon container sensor..."
-          # VERIFY - could not confirm exact output format via CrowdStrike MCP
+          # VERIFY - sensor-pull output format not confirmed via CrowdStrike MCP
           SENSOR_OUTPUT=$(./falcon-pull.sh \
             --client-id "${{ secrets.FALCON_CLIENT_ID }}" \
             --client-secret "${{ secrets.FALCON_CLIENT_SECRET }}" \
             --type falcon-container \
             --platform x86_64 \
-            --region "${{ inputs.falconRegion }}")
+            --region "${{ inputs.falconRegion || 'us-1' }}")
 
-          # Extract sensor image reference - this parsing may be fragile
           SENSOR_IMAGE=$(echo "$SENSOR_OUTPUT" | grep -E "(Downloaded newer image for|Pull complete)" | tail -1 | awk '{print $NF}' || echo "")
-
           if [ -z "$SENSOR_IMAGE" ]; then
-            echo "::error::Failed to extract sensor image reference from output"
-            echo "Script output:"
-            echo "$SENSOR_OUTPUT"
-            exit 1
+            echo "::error::Failed to extract sensor image reference"; echo "$SENSOR_OUTPUT"; exit 1
           fi
-
           echo "Sensor image: $SENSOR_IMAGE"
 
-          # Tag sensor for ACR and push
-          echo "Tagging sensor as ${{ steps.vars.outputs.sensor_image }}..."
           docker tag "$SENSOR_IMAGE" "${{ steps.vars.outputs.sensor_image }}"
-
-          echo "Pushing sensor to ACR..."
           docker push "${{ steps.vars.outputs.sensor_image }}"
-
           echo "sensor-ref=${{ steps.vars.outputs.sensor_image }}" >> $GITHUB_OUTPUT
 
       - name: Patch image with Falcon sensor
         id: patch-image
         run: |
           set -euo pipefail
-
           BASE_IMAGE="${{ steps.vars.outputs.base_image }}"
           SENSOR_IMAGE="${{ steps.vars.outputs.sensor_image }}"
           TARGET_IMAGE="${{ steps.vars.outputs.patched_image }}"
 
           echo "Patching ${BASE_IMAGE} with sensor ${SENSOR_IMAGE}..."
-
-          # VERIFY - could not confirm exact falconutil flags via CrowdStrike MCP
+          # falconutil injects the sensor and stamps ACA attribution metadata
+          # (--subscription/--resource-group/--cloud-service) into the image.
+          # VERIFY - falconutil flags not confirmed via CrowdStrike MCP
           PATCH_OUTPUT=$(docker run --user 0:0 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --rm "${SENSOR_IMAGE}" \
@@ -254,36 +237,26 @@ jobs:
             --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             --cloud-service ACA \
             --cid "${{ secrets.FALCON_CID }}")
-
           echo "$PATCH_OUTPUT"
 
-          # Extract patched image digest - parsing may be fragile
           PATCHED_DIGEST=$(echo "$PATCH_OUTPUT" | grep -E "writing image" | awk '{print $4}' || echo "")
-
           if [ -z "$PATCHED_DIGEST" ]; then
-            echo "::warning::Could not extract digest from patch output, resolving from registry..."
-            # Fallback: resolve digest from ACR
+            echo "::warning::Could not parse digest from patch output; resolving from ACR..."
             PATCHED_DIGEST=$(az acr manifest show --name "${TARGET_IMAGE#*/}" --registry ${{ vars.ACR_NAME }} --query digest -o tsv)
           fi
-
-          echo "Patched image digest: $PATCHED_DIGEST"
-          echo "Patched image reference: $TARGET_IMAGE"
-
           echo "digest=${PATCHED_DIGEST}" >> $GITHUB_OUTPUT
           echo "ref=${TARGET_IMAGE}" >> $GITHUB_OUTPUT
 
-      - name: CrowdStrike Image Scan (ExPRT-Critical gate)
+      - name: CrowdStrike Image Scan (policy gate)
         uses: crowdstrike/fcs-action@v2.0.2
         id: fcs-scan
-        # The image-scan exit code is driven by the Falcon console Image
-        # Assessment POLICY. The action SETS the exit-code output but
-        # does not fail the build itself; the explicit gate step below acts on
-        # it. Results are uploaded for the Falcon console pivot.
+        # For image scans the exit code reflects the Falcon console image-assessment
+        # POLICY verdict (not the minimum_exprt flag). The action sets exit-code;
+        # the explicit gate step below acts on it.
         with:
           falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
-          falcon_region: ${{ inputs.falconRegion }}
+          falcon_region: ${{ inputs.falconRegion || 'us-1' }}
           scan_type: 'image'
-          # Scan the patched image by its unique SHA-based tag
           image: ${{ steps.patch-image.outputs.ref }}
           minimum_exprt: 'critical'
           report_formats: 'json'
@@ -300,84 +273,38 @@ jobs:
         env:
           IMAGE: ${{ steps.patch-image.outputs.ref }}
           GATE_EXIT: ${{ steps.fcs-scan.outputs.exit-code }}
+          SCENARIO: ${{ steps.vars.outputs.scenario }}
         run: |
           set +e
           SUMMARY=fcs-summary.md
           : > "$SUMMARY"
 
-          # ---- Verdict heading ----
           if [ "${GATE_EXIT:-0}" != "0" ]; then
-            echo "## ❌ Build blocked by Falcon image assessment" >> "$SUMMARY"
+            echo "## ❌ Image blocked by Falcon image-assessment policy" >> "$SUMMARY"
           else
-            echo "## ✅ Falcon image assessment passed" >> "$SUMMARY"
+            echo "## ✅ Falcon image-assessment passed" >> "$SUMMARY"
           fi
           echo "" >> "$SUMMARY"
           SHORT_SHA=$(printf '%.8s' "$GITHUB_SHA")
-          echo "**Image:** \`${IMAGE}\` &nbsp;|&nbsp; **Commit:** \`${SHORT_SHA}\` &nbsp;|&nbsp; **Scanned:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$SUMMARY"
+          echo "**Scenario:** \`${SCENARIO}\` &nbsp;|&nbsp; **Image:** \`${IMAGE}\` &nbsp;|&nbsp; **Commit:** \`${SHORT_SHA}\` &nbsp;|&nbsp; **Gate exit:** \`${GATE_EXIT}\`" >> "$SUMMARY"
           echo "" >> "$SUMMARY"
 
-          # ---- Image assessment (blocking gate) ----
           if [ -f scan-image.json ]; then
-            echo "### Container Image Assessment (blocking)" >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
+            echo "### Container Image Assessment (blocking)" >> "$SUMMARY"; echo "" >> "$SUMMARY"
             CRIT=$(jq -r '.VulnerabilitiesSummary.severities.critical // 0' scan-image.json 2>/dev/null || echo 0)
             HIGH=$(jq -r '.VulnerabilitiesSummary.severities.high // 0' scan-image.json 2>/dev/null || echo 0)
-            MED=$(jq -r '.VulnerabilitiesSummary.severities.medium // 0' scan-image.json 2>/dev/null || echo 0)
-            LOW=$(jq -r '.VulnerabilitiesSummary.severities.low // 0' scan-image.json 2>/dev/null || echo 0)
             TOTAL=$(jq -r '.VulnerabilitiesSummary.count // 0' scan-image.json 2>/dev/null || echo 0)
-            POLICY_DENY=$(jq -r '.PolicyResponse.deny // false' scan-image.json 2>/dev/null || echo false)
             POLICY_NAME=$(jq -r '.PolicyResponse.policy.name // "N/A"' scan-image.json 2>/dev/null || echo "N/A")
-            echo "| Severity | Count |" >> "$SUMMARY"
-            echo "|----------|-------|" >> "$SUMMARY"
-            echo "| Critical | $CRIT |" >> "$SUMMARY"
-            echo "| High | $HIGH |" >> "$SUMMARY"
-            echo "| Medium | $MED |" >> "$SUMMARY"
-            echo "| Low | $LOW |" >> "$SUMMARY"
-            echo "| **Total** | **$TOTAL** |" >> "$SUMMARY"
+            POLICY_DENY=$(jq -r '.PolicyResponse.deny // false' scan-image.json 2>/dev/null || echo false)
+            echo "| Critical | High | Total |" >> "$SUMMARY"
+            echo "|----------|------|-------|" >> "$SUMMARY"
+            echo "| $CRIT | $HIGH | $TOTAL |" >> "$SUMMARY"
             echo "" >> "$SUMMARY"
-            echo "**Image Assessment Policy:** $POLICY_NAME &nbsp;|&nbsp; **Denied:** \`$POLICY_DENY\` &nbsp;|&nbsp; **Gate exit code:** \`${GATE_EXIT}\`" >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
-            echo "<details><summary><b>View ExPRT-Critical / High CVEs</b></summary>" >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
-            jq -r '.Vulnerabilities[]? | select(.Vulnerability != null) | select(.Vulnerability.Details.cps_rating.CurrentRating.Rating == "CRITICAL" or .Vulnerability.Details.severity == "CRITICAL" or .Vulnerability.Details.severity == "HIGH") | "##### \(.Vulnerability.CVEID // "CVE-UNKNOWN")\n\n**Package:** \(.Vulnerability.Product.Product // "N/A") \(.Vulnerability.Product.MajorVersion // "")\n\n**Severity:** \(.Vulnerability.Details.severity) | **ExPRT Rating:** \(.Vulnerability.Details.cps_rating.CurrentRating.Rating // "N/A") | **CVSS:** \(.Vulnerability.Details.base_score // "N/A")\n\n\(.Vulnerability.Details.description // "")\n\n**Remediation:** \(if .Vulnerability.Remediation then (.Vulnerability.Remediation | join(", ")) else "Update to the latest patched version" end)\n\n---\n"' scan-image.json >> "$SUMMARY" 2>/dev/null || echo "*CVE details unavailable — see Falcon console.*" >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
-            echo "</details>" >> "$SUMMARY"
+            echo "**Policy:** $POLICY_NAME &nbsp;|&nbsp; **Denied:** \`$POLICY_DENY\`" >> "$SUMMARY"
             echo "" >> "$SUMMARY"
           fi
 
-          # ---- IaC scan (shift-left, non-blocking) ----
-          if [ -f scan-iac.json ]; then
-            echo "### Infrastructure-as-Code Scan (non-blocking)" >> "$SUMMARY"
-            IAC_TOTAL=$(jq -r '.detection_summary.total // 0' scan-iac.json 2>/dev/null || echo 0)
-            IAC_HIGH=$(jq -r '.detection_summary.high // 0' scan-iac.json 2>/dev/null || echo 0)
-            IAC_MED=$(jq -r '.detection_summary.medium // 0' scan-iac.json 2>/dev/null || echo 0)
-            IAC_LOW=$(jq -r '.detection_summary.low // 0' scan-iac.json 2>/dev/null || echo 0)
-            IAC_INFO=$(jq -r '.detection_summary.informational // 0' scan-iac.json 2>/dev/null || echo 0)
-            echo "" >> "$SUMMARY"
-            echo "| Severity | Count |" >> "$SUMMARY"
-            echo "|----------|-------|" >> "$SUMMARY"
-            echo "| High | $IAC_HIGH |" >> "$SUMMARY"
-            echo "| Medium | $IAC_MED |" >> "$SUMMARY"
-            echo "| Low | $IAC_LOW |" >> "$SUMMARY"
-            echo "| Informational | $IAC_INFO |" >> "$SUMMARY"
-            echo "| **Total** | **$IAC_TOTAL** |" >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
-            echo "> This scans Dockerfiles, CI/CD configs, and any infrastructure code for security misconfigurations." >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
-            if [ "$IAC_TOTAL" -gt 0 ]; then
-              echo "<details><summary><b>View IaC findings</b></summary>" >> "$SUMMARY"
-              echo "" >> "$SUMMARY"
-              jq -r '.rule_detections[]? | select(.severity == "High" or .severity == "Medium") | "##### \(.rule_name) (\(.severity))\n\n**Category:** \(.rule_category) | **Platform:** \(.platform)\n\n\(.description)\n\n\(.detections[]? | "- `\(.file):\(.line)` — \(.resource_type) `\(.resource_name)`\n  - Issue: \(.reason)\n  - Fix: \(.recommendation)")\n\n---\n"' scan-iac.json >> "$SUMMARY" 2>/dev/null || echo "*Details unavailable — see Falcon console.*" >> "$SUMMARY"
-              echo "" >> "$SUMMARY"
-              echo "</details>" >> "$SUMMARY"
-              echo "" >> "$SUMMARY"
-            fi
-          fi
-
-          # Mirror to the run's job summary
           cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
-
-          # Set outputs
           echo "passed=$([ "${GATE_EXIT:-0}" = "0" ] && echo "true" || echo "false")" >> $GITHUB_OUTPUT
           echo "exit-code=${GATE_EXIT:-0}" >> $GITHUB_OUTPUT
           true
@@ -393,10 +320,10 @@ jobs:
             fcs-summary.md
           retention-days: 30
 
-      - name: Fail on image-assessment policy violations
-        if: ${{ inputs.failOnPolicyViolation && steps.fcs-scan.outputs.exit-code != '0' }}
+      - name: Fail on image-assessment policy violation
+        if: ${{ inputs.failOnPolicyViolation && steps.fcs-summary.outputs.exit-code != '0' }}
         run: |
-          echo "::error::Falcon image-assessment policy denied this image (exit code: ${{ steps.fcs-scan.outputs.exit-code }}). See the scan results in the job summary above — remediate the flagged CVE(s) and re-push to clear the gate."
+          echo "::error::Falcon image-assessment policy denied this image (exit ${{ steps.fcs-summary.outputs.exit-code }}). Scenario='${{ steps.vars.outputs.scenario }}'. Remediate the finding (or run scenario=clean) to clear the gate."
           exit 1
 
   deploy:
@@ -405,7 +332,7 @@ jobs:
     timeout-minutes: 15
     needs: build-scan-and-gate
     if: ${{ inputs.deployToACA && needs.build-scan-and-gate.outputs.scan-passed == 'true' }}
-    environment: production  # Requires manual approval in GitHub environment settings
+    environment: production
 
     steps:
       - name: Azure login via OIDC
@@ -419,70 +346,19 @@ jobs:
         id: ensure-environment
         run: |
           set -euo pipefail
-
-          RG="${{ vars.RESOURCE_GROUP }}"
-          ENV_NAME="${{ vars.ACA_ENV_NAME }}"
-          LOCATION="${{ vars.AZURE_LOCATION }}"
-
-          echo "Checking if Container Apps environment '${ENV_NAME}' exists in resource group '${RG}'..."
-
-          # Check if environment exists
-          ENV_EXISTS=$(az containerapp env show \
-            --name "${ENV_NAME}" \
-            --resource-group "${RG}" \
-            --query "name" -o tsv 2>/dev/null || echo "")
-
-          if [ -n "$ENV_EXISTS" ]; then
-            echo "✅ Container Apps environment '${ENV_NAME}' already exists"
-            ENV_STATUS="exists"
+          RG="${{ vars.RESOURCE_GROUP }}"; ENV_NAME="${{ vars.ACA_ENV_NAME }}"; LOCATION="${{ vars.AZURE_LOCATION }}"
+          if az containerapp env show --name "${ENV_NAME}" --resource-group "${RG}" --query "name" -o tsv 2>/dev/null; then
+            echo "Environment '${ENV_NAME}' already exists"; echo "status=exists" >> $GITHUB_OUTPUT
           else
-            echo "🔧 Creating Container Apps environment '${ENV_NAME}'..."
-
-            # Create the environment with default configuration
-            az containerapp env create \
-              --name "${ENV_NAME}" \
-              --resource-group "${RG}" \
-              --location "${LOCATION}" \
-              --logs-destination none \
-              --output table
-
-            echo "✅ Container Apps environment '${ENV_NAME}' created successfully"
-            ENV_STATUS="created"
+            echo "Creating environment '${ENV_NAME}'..."
+            az containerapp env create --name "${ENV_NAME}" --resource-group "${RG}" --location "${LOCATION}" --logs-destination none --output table
+            echo "status=created" >> $GITHUB_OUTPUT
           fi
-
-          echo "status=${ENV_STATUS}" >> $GITHUB_OUTPUT
-
-      - name: Ensure Container App exists
-        id: ensure-app
-        run: |
-          set -euo pipefail
-
-          RG="${{ vars.RESOURCE_GROUP }}"
-          APP_NAME="${{ vars.CONTAINER_APP_NAME }}"
-          ENV_NAME="${{ vars.ACA_ENV_NAME }}"
-
-          echo "Checking if Container App '${APP_NAME}' exists..."
-
-          # Check if container app exists
-          APP_EXISTS=$(az containerapp show \
-            --name "${APP_NAME}" \
-            --resource-group "${RG}" \
-            --query "name" -o tsv 2>/dev/null || echo "")
-
-          if [ -n "$APP_EXISTS" ]; then
-            echo "✅ Container App '${APP_NAME}' already exists - will update with new image"
-            APP_ACTION="update"
-          else
-            echo "🔧 Container App '${APP_NAME}' does not exist - will create"
-            APP_ACTION="create"
-          fi
-
-          echo "action=${APP_ACTION}" >> $GITHUB_OUTPUT
 
       - name: Deploy to Azure Container Apps
-        # Using Azure Container Apps deploy action for better integration vs raw az CLI
-        # Trade-off: Action provides better revision management and rollback capabilities
-        # vs az CLI which offers more granular control but requires manual revision handling
+        # Registry auth to ACR is handled via the OIDC-logged-in az context.
+        # No environmentVariables here: the action passes them as --replace-env-vars,
+        # which is update-only and errors on `az containerapp create`.
         uses: azure/container-apps-deploy-action@v2
         with:
           containerAppName: ${{ vars.CONTAINER_APP_NAME }}
@@ -491,17 +367,11 @@ jobs:
           imageToDeploy: ${{ needs.build-scan-and-gate.outputs.patched-image-ref }}
           targetPort: 80
           ingress: external
-          # NOTE: do NOT set environmentVariables here — the action passes it as
-          # `--replace-env-vars`, which is an UPDATE-only flag and is rejected by
-          # `az containerapp create` on first deploy (exit code 2). nginx needs no
-          # env vars anyway; set them via a later `az containerapp update` if required.
 
       - name: Deployment summary
         run: |
           echo "## 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Container App**: ${{ vars.CONTAINER_APP_NAME }} (${{ steps.ensure-app.outputs.action }})" >> $GITHUB_STEP_SUMMARY
-          echo "- **Environment**: ${{ vars.ACA_ENV_NAME }} (${{ steps.ensure-environment.outputs.status }})" >> $GITHUB_STEP_SUMMARY
-          echo "- **Resource Group**: ${{ vars.RESOURCE_GROUP }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Location**: ${{ vars.AZURE_LOCATION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Scan Exit Code**: ${{ needs.build-scan-and-gate.outputs.scan-exit-code }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Scenario:** ${{ needs.build-scan-and-gate.outputs.scenario }} (passed the gate)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container App:** ${{ vars.CONTAINER_APP_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ vars.ACA_ENV_NAME }} (${{ steps.ensure-environment.outputs.status }})" >> $GITHUB_STEP_SUMMARY
