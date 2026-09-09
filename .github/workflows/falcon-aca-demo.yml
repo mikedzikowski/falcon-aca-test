@@ -431,7 +431,18 @@ jobs:
           fi
           echo "Using managed identity: $UAMI_ID"
 
-          if az containerapp show -n "$APP" -g "$RG" >/dev/null 2>&1; then
+          # If the app exists but is stuck in a Failed provisioning state (e.g. a
+          # prior broken create), delete it so we can recreate cleanly — update
+          # can't recover a Failed app.
+          STATE=$(az containerapp show -n "$APP" -g "$RG" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "NotFound")
+          echo "Current provisioning state: ${STATE}"
+          if [ "$STATE" = "Failed" ]; then
+            echo "App is in Failed state — deleting before recreate..."
+            az containerapp delete -n "$APP" -g "$RG" --yes -o none
+            STATE="NotFound"
+          fi
+
+          if [ "$STATE" != "NotFound" ] && az containerapp show -n "$APP" -g "$RG" >/dev/null 2>&1; then
             echo "Updating existing Container App ${APP}..."
             az containerapp registry set -n "$APP" -g "$RG" \
               --server "$ACR_SERVER" --identity "$UAMI_ID" -o none
