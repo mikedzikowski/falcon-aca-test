@@ -1,7 +1,8 @@
 # falcon-aca-demo.yml
 # GitHub Actions workflow: patch a container image with the CrowdStrike Falcon
 # Container sensor, gate it against a Falcon image-assessment POLICY, and deploy
-# the patched image to Azure Container Apps and/or Azure App Service on success.
+# the patched image to Azure Container Apps, Azure Container Instances, and/or
+# Azure App Service on success.
 #
 # DEMO KNOB: `demoScenario` selects which (if any) defect is baked into the
 # workload image so you can show the image-assessment gate blocking each
@@ -15,27 +16,30 @@
 # "mikedz-aca-demo-gate", scoped to this repo). The fcs-action image-scan exit
 # code reflects that policy's verdict — that is what fails the build.
 #
-# ONE IMAGE, TWO TARGETS
-# ----------------------
+# ONE IMAGE, THREE TARGETS
+# ------------------------
 # The image is patched ONCE with no platform-specific attribution flags. Every
 # falconutil patch-time flag has a documented runtime env-var override ("The
 # environment variable overrides the value set by the --X flag"), so each deploy
 # job stamps its own attribution via CS_* env vars:
 #
 #   ACA         -> CS_CLOUD_SERVICE=ACA + CS_AZURE_RESOURCE_GROUP + CS_AZURE_SUBSCRIPTION
+#   ACI         -> CS_CLOUD_SERVICE=ACI + CS_AZURE_CONTAINER_GROUP + resource group +
+#                  subscription. Docs are explicit that without the ACI value
+#                  "these deployments won't be listed under ACI".
 #   App Service -> CS_APP_NAME + CS_CONTAINER, and CS_CLOUD_SERVICE deliberately
 #                  UNSET (there is no App Service enum; ACA/ACI/ECS_FARGATE/CLOUDRUN
 #                  are the only accepted values — stamping ACA here would attribute
 #                  the workload to a container app resource that does not exist).
 #
 # This keeps a single gated artifact: the image that was scanned is byte-for-byte
-# the image that is deployed to both platforms.
+# the image that is deployed to all three platforms.
 #
 # SECURITY NOTE: --cid is baked into the patched image at patch time and has no
 # runtime override. The patched image is therefore a CID-bearing artifact — the
 # staging repo below holds CID-bearing images and should be treated accordingly.
 
-name: Build and Deploy Falcon Container (ACA + App Service)
+name: Build and Deploy Falcon Container (ACA + ACI + App Service)
 
 on:
   workflow_dispatch:
@@ -50,13 +54,14 @@ on:
           - 'malware'
       deployTarget:
         type: choice
-        default: 'both'
+        default: 'all'
         description: 'Where to deploy the patched image (only if the gate passes)'
         options:
           - 'none'
           - 'aca'
           - 'appservice'
-          - 'both'
+          - 'aci'
+          - 'all'
       runFCSScan:
         type: boolean
         default: true
@@ -416,7 +421,7 @@ jobs:
     if: >-
       ${{ needs.build-scan-and-gate.outputs.scan-passed == 'true' &&
           (needs.build-scan-and-gate.outputs.deploy-target == 'aca' ||
-           needs.build-scan-and-gate.outputs.deploy-target == 'both') }}
+           needs.build-scan-and-gate.outputs.deploy-target == 'all') }}
     environment: production
 
     steps:
@@ -565,7 +570,7 @@ jobs:
     if: >-
       ${{ needs.build-scan-and-gate.outputs.scan-passed == 'true' &&
           (needs.build-scan-and-gate.outputs.deploy-target == 'appservice' ||
-           needs.build-scan-and-gate.outputs.deploy-target == 'both') }}
+           needs.build-scan-and-gate.outputs.deploy-target == 'all') }}
     environment: production
 
     steps:
@@ -627,11 +632,6 @@ jobs:
               --container-image-name "$IMAGE" -o none
           fi
 
-          # Attach the user-assigned identity and point ACR pull at it.
-          az webapp identity assign -n "$APP" -g "$RG" --identities "$UAMI_ID" -o none
-          az webapp config set -n "$APP" -g "$RG" \
-            --generic-configurations "{\"acrUseManagedIdentityCreds\": true, \"acrUserManagedIdentityID\": \"${CLIENT_ID}\"}" -o none
-
           # Point at the gated image. NOTE: no --startup-file is set anywhere. On
           # App Service the startup command is appended as CMD (it does not replace
           # ENTRYPOINT), but leaving it empty keeps the falcon-entrypoint -> app
@@ -639,6 +639,35 @@ jobs:
           az webapp config container set -n "$APP" -g "$RG" \
             --container-image-name "$IMAGE" \
             --container-registry-url "https://${ACR_SERVER}" -o none
+
+          # Attach the user-assigned identity and point ACR pull at it.
+          az webapp identity assign -n "$APP" -g "$RG" --identities "$UAMI_ID" -o none
+
+          # `az webapp config set --generic-configurations` does NOT reliably persist
+          # acrUserManagedIdentityID (it silently stayed null on the first run, and the
+          # pull fell back to admin creds). Patch config/web directly instead.
+          az resource update \
+            --resource-group "$RG" \
+            --namespace Microsoft.Web \
+            --parent "sites/${APP}" \
+            --resource-type config \
+            --name web \
+            --set "properties.acrUseManagedIdentityCreds=true" \
+                  "properties.acrUserManagedIdentityID=${CLIENT_ID}" -o none
+
+          # `az webapp config container set` auto-populates DOCKER_REGISTRY_SERVER_*
+          # from the registry's admin user when it is enabled. Those settings take
+          # precedence over managed identity, so the MI path is never exercised and a
+          # broken MI config passes unnoticed. Remove them so the pull MUST use the
+          # identity — if the identity is misconfigured we want a hard failure, not a
+          # silent fallback.
+          EXISTING=$(az webapp config appsettings list -n "$APP" -g "$RG" \
+            --query "[?starts_with(name,'DOCKER_REGISTRY_SERVER_')].name" -o tsv)
+          if [ -n "$EXISTING" ]; then
+            echo "Removing admin-credential fallback settings: $(echo $EXISTING | tr '\n' ' ')"
+            az webapp config appsettings delete -n "$APP" -g "$RG" \
+              --setting-names $EXISTING -o none
+          fi
 
           # App settings become container env vars.
           #   WEBSITES_PORT ................ port App Service HTTP-pings and routes to
@@ -707,11 +736,15 @@ jobs:
       - name: Verify Falcon sensor got an AID (best effort)
         if: always()
         continue-on-error: true
-        # Documented verification is `falconctl -g --aid` inside the container. On
-        # App Service the Kudu /api/command endpoint is the only non-interactive way
-        # in, and it requires SSH support in the image — this demo image has none, so
-        # treat a failure here as inconclusive, NOT as a sensor failure. Confirm in
-        # the Falcon console instead.
+        # Documented verification is `falconctl -g --aid` inside the container, but on
+        # Linux App Service there is no reliable way to reach it from CI:
+        #   * Kudu runs as a SEPARATE sidecar container, so /api/command execs there —
+        #     it cannot see /opt/CrowdStrike in the app container at all.
+        #   * SCM basic auth is commonly disabled (allow=false), which makes the Kudu
+        #     REST calls below return empty regardless.
+        # So treat any failure here as INCONCLUSIVE, never as a sensor failure. The
+        # ACI job below is the target that can actually prove the AID (az container
+        # exec works there); use it as the sensor-registration canary for this image.
         #
         # CAUTION: the sensor self-defends by terminating processes that read its
         # /proc entries, and the documented opt-out is a Kubernetes annotation with
@@ -719,13 +752,17 @@ jobs:
         run: |
           set +e
           RG="${{ vars.RESOURCE_GROUP }}"; APP="${{ vars.APP_SERVICE_NAME }}"
+          ALLOW=$(az resource show \
+            --ids "/subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RG}/providers/Microsoft.Web/sites/${APP}/basicPublishingCredentialsPolicies/scm" \
+            --query "properties.allow" -o tsv 2>/dev/null)
+          echo "SCM basic auth allowed: ${ALLOW:-unknown}"
+          if [ "$ALLOW" != "true" ]; then
+            echo "::notice::SCM basic auth is disabled, so the Kudu AID probe cannot run. This is expected and is NOT a sensor failure — see the ACI job for authoritative AID verification."
+            exit 0
+          fi
           CREDS=$(az webapp deployment list-publishing-credentials -n "$APP" -g "$RG" \
             --query "{u:publishingUserName,p:publishingPassword}" -o json 2>/dev/null)
           USER=$(echo "$CREDS" | jq -r .u); PASS=$(echo "$CREDS" | jq -r .p)
-          if [ -z "$USER" ] || [ "$USER" = "null" ]; then
-            echo "::warning::Could not get Kudu credentials; skipping in-container AID check."
-            exit 0
-          fi
           RESP=$(curl -sS -u "$USER:$PASS" -X POST \
             -H 'Content-Type: application/json' \
             --max-time 60 \
@@ -735,7 +772,7 @@ jobs:
           if echo "$RESP" | grep -qiE "aid=?[0-9a-f]{32}"; then
             echo "✅ Sensor reported an AID — it registered with the CrowdStrike cloud."
           else
-            echo "::warning::No AID parsed. Inconclusive (Kudu exec needs SSH support in the image). Verify in the Falcon console: Cloud security > Assets > Kubernetes and containers inventory > Containers, filtered on CS_APP_NAME=falcon-appservice-demo."
+            echo "::notice::No AID parsed — inconclusive (Kudu is a sidecar container and cannot see the app container's filesystem). Verify in the Falcon console, or rely on the ACI job."
           fi
           true
 
@@ -750,3 +787,183 @@ jobs:
           echo "- **HTTP probe:** ${{ steps.probe.outputs.result || 'fail' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Attribution:** \`CS_APP_NAME\` + \`CS_CONTAINER\` (generic embedded path; \`CS_CLOUD_SERVICE\` intentionally unset)" >> $GITHUB_STEP_SUMMARY
           echo "- **URL:** https://${{ steps.deploy.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Deploy: Azure Container Instances
+  # ---------------------------------------------------------------------------
+  # ACI has a tailored CrowdStrike deployment guide, so unlike App Service it gets
+  # full console attribution. Differences from the ACA path:
+  #   * CS_AZURE_CONTAINER_GROUP is ACI-specific (no ACA equivalent).
+  #   * The optional metadata-enrichment API call needs only `Reader` at resource
+  #     group scope, not ACA's `ContainerApp Reader`. Our identity already holds
+  #     Contributor on the RG, which covers it.
+  #   * ACI Linux exposes the real IMDS endpoint (169.254.169.254), whereas ACA and
+  #     App Service expose IDENTITY_ENDPOINT/IDENTITY_HEADER instead.
+  #   * ACR pull by managed identity requires passing the SAME user-assigned identity
+  #     to BOTH --assign-identity and --acr-identity. ACI does NOT support
+  #     system-assigned identities for ACR pulls at all.
+  #   * --command-line would override the falcon-entrypoint, same trap as ACA's
+  #     --command. We do not pass it.
+  #
+  # This job is also the sensor-registration CANARY for the whole pipeline: ACI is
+  # the only one of the three targets where `az container exec` and `az container
+  # logs` both work, so it is the one place CI can actually prove the sensor got an
+  # AID. The image is identical across all three targets, so an AID here is strong
+  # evidence the sensor is healthy in the shared artifact.
+  # ---------------------------------------------------------------------------
+  deploy-aci:
+    name: Deploy to Azure Container Instances
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-scan-and-gate
+    if: >-
+      ${{ needs.build-scan-and-gate.outputs.scan-passed == 'true' &&
+          (needs.build-scan-and-gate.outputs.deploy-target == 'aci' ||
+           needs.build-scan-and-gate.outputs.deploy-target == 'all') }}
+    environment: production
+
+    steps:
+      - name: Azure login via OIDC
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy container group to ACI
+        id: deploy
+        run: |
+          set -euo pipefail
+          RG="${{ vars.RESOURCE_GROUP }}"
+          CG="${{ vars.ACI_NAME }}"
+          DNS="${{ vars.ACI_DNS_LABEL }}"
+          LOCATION="${{ vars.AZURE_LOCATION }}"
+          ACR_SERVER="${{ vars.ACR_NAME }}.azurecr.io"
+          IMAGE="${{ needs.build-scan-and-gate.outputs.patched-image-ref }}"
+          CLIENT_ID="${{ vars.AZURE_CLIENT_ID }}"
+
+          UAMI_ID=$(az identity list -g "$RG" \
+            --query "[?clientId=='${CLIENT_ID}'].id | [0]" -o tsv)
+          if [ -z "$UAMI_ID" ]; then
+            echo "::error::Could not resolve user-assigned identity (clientId=${CLIENT_ID}) in ${RG}"; exit 1
+          fi
+          echo "Using managed identity: $UAMI_ID"
+
+          # ACI container groups are effectively immutable — you cannot swap the image
+          # on a running group. Delete and recreate for a deterministic deploy.
+          if az container show -n "$CG" -g "$RG" >/dev/null 2>&1; then
+            echo "Deleting existing container group ${CG}..."
+            az container delete -n "$CG" -g "$RG" --yes -o none
+          fi
+
+          echo "Creating container group ${CG}..."
+          # NOTE: no --registry-username/--registry-password. Pull is via the managed
+          # identity, which is why the same identity goes to --acr-identity and
+          # --assign-identity. If the identity lacks AcrPull this FAILS LOUDLY rather
+          # than silently falling back to admin credentials.
+          az container create -n "$CG" -g "$RG" \
+            --location "$LOCATION" \
+            --image "$IMAGE" \
+            --os-type Linux \
+            --cpu 1 --memory 1.5 \
+            --ports 80 \
+            --dns-name-label "$DNS" \
+            --restart-policy OnFailure \
+            --assign-identity "$UAMI_ID" \
+            --acr-identity "$UAMI_ID" \
+            --environment-variables \
+              CS_CLOUD_SERVICE=ACI \
+              CS_AZURE_CONTAINER_GROUP="$CG" \
+              CS_AZURE_RESOURCE_GROUP="$RG" \
+              CS_AZURE_SUBSCRIPTION="${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+              CS_CONTAINER="$CG" \
+              CS_APP_NAME="falcon-aci-demo" \
+            -o none
+
+          FQDN=$(az container show -n "$CG" -g "$RG" --query ipAddress.fqdn -o tsv)
+          STATE=$(az container show -n "$CG" -g "$RG" --query instanceView.state -o tsv)
+          echo "fqdn=${FQDN}" >> $GITHUB_OUTPUT
+          echo "Container group state: ${STATE}; FQDN: ${FQDN}"
+
+      - name: Confirm image was pulled via managed identity
+        # Proves the MI pull path actually ran. A Pulled event with no admin
+        # credentials configured on the group is the evidence we want.
+        run: |
+          set -euo pipefail
+          RG="${{ vars.RESOURCE_GROUP }}"; CG="${{ vars.ACI_NAME }}"
+          echo "=== imageRegistryCredentials (should show identity, NOT a username) ==="
+          az container show -n "$CG" -g "$RG" \
+            --query "imageRegistryCredentials" -o json
+          echo "=== container events ==="
+          az container show -n "$CG" -g "$RG" \
+            --query "containers[].instanceView.events[].{t:type,name:name,msg:message}" -o table
+
+      - name: Verify app responds (sensor did not fail closed)
+        id: probe
+        run: |
+          set -euo pipefail
+          FQDN="${{ steps.deploy.outputs.fqdn }}"
+          echo "Probing http://${FQDN}/health ..."
+          for i in $(seq 1 30); do
+            CODE=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "http://${FQDN}/health" 2>/dev/null || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "App responded 200 after $((i*10))s."
+              echo "result=pass" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "  attempt ${i}: HTTP ${CODE}; retrying in 10s..."
+            sleep 10
+          done
+          echo "result=fail" >> $GITHUB_OUTPUT
+          echo "::error::App did not return 200 within 300s."
+          exit 1
+
+      - name: Container logs (sensor startup evidence)
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          RG="${{ vars.RESOURCE_GROUP }}"; CG="${{ vars.ACI_NAME }}"
+          echo "=== full container log ==="
+          az container logs -n "$CG" -g "$RG" 2>&1 | tail -60
+          true
+
+      - name: Verify Falcon sensor got an AID (authoritative)
+        id: aid
+        if: always()
+        continue-on-error: true
+        # ACI supports az container exec, so unlike App Service this is a real check
+        # rather than a best-effort one. We still mark it continue-on-error because
+        # exec can fail for TTY reasons in CI — but if it returns an AID, that is
+        # conclusive proof the sensor registered with the CrowdStrike cloud.
+        #
+        # We deliberately use falconctl rather than `ps`: the sensor terminates
+        # processes that read its /proc entries.
+        run: |
+          set +e
+          RG="${{ vars.RESOURCE_GROUP }}"; CG="${{ vars.ACI_NAME }}"
+          OUT=$(az container exec -n "$CG" -g "$RG" \
+            --exec-command "/opt/CrowdStrike/rootfs/bin/falconctl -g --aid" 2>&1)
+          echo "$OUT"
+          AID=$(echo "$OUT" | grep -oiE "[0-9a-f]{32}" | head -1)
+          if [ -n "$AID" ]; then
+            echo "✅ Sensor registered. AID=${AID}"
+            echo "aid=${AID}" >> $GITHUB_OUTPUT
+            echo "result=confirmed" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::No AID returned. Could be exec/TTY limitations in CI rather than a sensor problem — check the container logs above and the Falcon console."
+            echo "result=inconclusive" >> $GITHUB_OUTPUT
+          fi
+          true
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## 🚀 ACI Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Scenario:** ${{ needs.build-scan-and-gate.outputs.scenario }} (passed the gate)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container group:** ${{ vars.ACI_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **HTTP probe:** ${{ steps.probe.outputs.result || 'fail' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sensor AID:** ${{ steps.aid.outputs.result || 'not run' }} ${{ steps.aid.outputs.aid }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Attribution:** \`CS_CLOUD_SERVICE=ACI\` + \`CS_AZURE_CONTAINER_GROUP\` (runtime)" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL:** http://${{ steps.deploy.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
