@@ -172,7 +172,18 @@ jobs:
           echo "prod_patched=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}-patched" >> $GITHUB_OUTPUT
           echo "sensor_image=${REGISTRY}/falcon-container:${TAG}"            >> $GITHUB_OUTPUT
 
-          echo "### 🎬 Demo scenario: \`${SCENARIO}\` — deploy target: \`${TARGET}\`" >> $GITHUB_STEP_SUMMARY
+          # Friendly platform names for the run summary. The raw key (aca/aci/
+          # appservice/all) drives the job conditions; this is display only.
+          case "$TARGET" in
+            none)       TARGET_LABEL="none — build and gate only" ;;
+            aca)        TARGET_LABEL="Azure Container Apps" ;;
+            aci)        TARGET_LABEL="Azure Container Instances" ;;
+            appservice) TARGET_LABEL="Azure App Service" ;;
+            all)        TARGET_LABEL="Azure Container Apps + Azure Container Instances + Azure App Service" ;;
+            *)          TARGET_LABEL="$TARGET" ;;
+          esac
+          echo "### 🎬 Demo scenario: \`${SCENARIO}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Deploy target:** ${TARGET_LABEL}" >> $GITHUB_STEP_SUMMARY
 
       - name: Azure login via OIDC
         uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
@@ -531,9 +542,10 @@ jobs:
 
       - name: Deployment summary
         run: |
-          echo "## 🚀 ACA Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Azure Container Apps — deployment complete" >> $GITHUB_STEP_SUMMARY
           echo "- **Scenario:** ${{ needs.build-scan-and-gate.outputs.scenario }} (passed the gate)" >> $GITHUB_STEP_SUMMARY
           echo "- **Image:** \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform:** Azure Container Apps" >> $GITHUB_STEP_SUMMARY
           echo "- **Container App:** ${{ vars.CONTAINER_APP_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Environment:** ${{ vars.ACA_ENV_NAME }} (${{ steps.ensure-environment.outputs.status }})" >> $GITHUB_STEP_SUMMARY
           echo "- **Attribution:** \`CS_CLOUD_SERVICE=ACA\` (runtime)" >> $GITHUB_STEP_SUMMARY
@@ -690,6 +702,32 @@ jobs:
           echo "fqdn=${FQDN}" >> $GITHUB_OUTPUT
           echo "Deployed. App URL: https://${FQDN}"
 
+      - name: Confirm image will be pulled via managed identity
+        # IMPORTANT: read acrUserManagedIdentityID from the config/web sub-resource,
+        # NOT from `az webapp show --query siteConfig.*`. That projection returns null
+        # even when the value IS set, which previously led us to conclude the MI
+        # config had failed when it had actually persisted correctly.
+        run: |
+          set -euo pipefail
+          RG="${{ vars.RESOURCE_GROUP }}"; APP="${{ vars.APP_SERVICE_NAME }}"
+          CFG=$(az resource show \
+            --ids "/subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RG}/providers/Microsoft.Web/sites/${APP}/config/web" \
+            --query "{acrMI:properties.acrUseManagedIdentityCreds,acrMIID:properties.acrUserManagedIdentityID}" -o json)
+          echo "$CFG"
+          MI=$(echo "$CFG" | jq -r .acrMI); MIID=$(echo "$CFG" | jq -r .acrMIID)
+          if [ "$MI" != "true" ] || [ -z "$MIID" ] || [ "$MIID" = "null" ]; then
+            echo "::error::Managed-identity ACR pull is not configured (acrUseManagedIdentityCreds=${MI}, acrUserManagedIdentityID=${MIID}). Admin credentials have been removed, so the next cold pull would fail."
+            exit 1
+          fi
+          echo "Managed-identity ACR pull configured with client id ${MIID}"
+          REMAINING=$(az webapp config appsettings list -n "$APP" -g "$RG" \
+            --query "[?starts_with(name,'DOCKER_REGISTRY_SERVER_')].name" -o tsv)
+          if [ -n "$REMAINING" ]; then
+            echo "::warning::Admin-credential settings still present: ${REMAINING}. The MI path may not actually be exercised."
+          else
+            echo "No admin-credential fallback present — the pull must use the identity."
+          fi
+
       - name: Verify app responds (sensor did not fail closed)
         id: probe
         # This is the load-bearing test. App Service health-pings the container and
@@ -779,9 +817,10 @@ jobs:
       - name: Deployment summary
         if: always()
         run: |
-          echo "## 🚀 App Service Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Azure App Service — deployment complete" >> $GITHUB_STEP_SUMMARY
           echo "- **Scenario:** ${{ needs.build-scan-and-gate.outputs.scenario }} (passed the gate)" >> $GITHUB_STEP_SUMMARY
           echo "- **Image:** \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform:** Azure App Service (Web App for Containers)" >> $GITHUB_STEP_SUMMARY
           echo "- **Web App:** ${{ vars.APP_SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Plan:** ${{ vars.APP_SERVICE_PLAN }} (${{ steps.ensure-plan.outputs.status }})" >> $GITHUB_STEP_SUMMARY
           echo "- **HTTP probe:** ${{ steps.probe.outputs.result || 'fail' }}" >> $GITHUB_STEP_SUMMARY
@@ -959,9 +998,10 @@ jobs:
       - name: Deployment summary
         if: always()
         run: |
-          echo "## 🚀 ACI Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Azure Container Instances — deployment complete" >> $GITHUB_STEP_SUMMARY
           echo "- **Scenario:** ${{ needs.build-scan-and-gate.outputs.scenario }} (passed the gate)" >> $GITHUB_STEP_SUMMARY
           echo "- **Image:** \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform:** Azure Container Instances" >> $GITHUB_STEP_SUMMARY
           echo "- **Container group:** ${{ vars.ACI_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **HTTP probe:** ${{ steps.probe.outputs.result || 'fail' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Sensor AID:** ${{ steps.aid.outputs.result || 'not run' }} ${{ steps.aid.outputs.aid }}" >> $GITHUB_STEP_SUMMARY
