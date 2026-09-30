@@ -1,22 +1,41 @@
 # falcon-aca-demo.yml
 # GitHub Actions workflow: patch a container image with the CrowdStrike Falcon
 # Container sensor, gate it against a Falcon image-assessment POLICY, and deploy
-# the patched image to Azure Container Apps on success.
+# the patched image to Azure Container Apps and/or Azure App Service on success.
 #
 # DEMO KNOB: `demoScenario` selects which (if any) defect is baked into the
 # workload image so you can show the image-assessment gate blocking each
 # detection type, then flip to `clean` to show it pass and deploy.
 #
-#   clean         -> healthy app            -> gate PASSES  -> deploys to ACA
+#   clean         -> healthy app            -> gate PASSES  -> deploys
 #   vulnerability -> aiohttp==3.9.1          -> CVE-2024-23334 -> gate BLOCKS
 #   malware       -> pull known-malware img  -> malware detection -> gate BLOCKS
-#   secret        -> hardcoded AWS/PEM creds  -> secret detection  -> gate BLOCKS
 #
 # The gate itself lives in the Falcon console (image-assessment policy
 # "mikedz-aca-demo-gate", scoped to this repo). The fcs-action image-scan exit
 # code reflects that policy's verdict — that is what fails the build.
+#
+# ONE IMAGE, TWO TARGETS
+# ----------------------
+# The image is patched ONCE with no platform-specific attribution flags. Every
+# falconutil patch-time flag has a documented runtime env-var override ("The
+# environment variable overrides the value set by the --X flag"), so each deploy
+# job stamps its own attribution via CS_* env vars:
+#
+#   ACA         -> CS_CLOUD_SERVICE=ACA + CS_AZURE_RESOURCE_GROUP + CS_AZURE_SUBSCRIPTION
+#   App Service -> CS_APP_NAME + CS_CONTAINER, and CS_CLOUD_SERVICE deliberately
+#                  UNSET (there is no App Service enum; ACA/ACI/ECS_FARGATE/CLOUDRUN
+#                  are the only accepted values — stamping ACA here would attribute
+#                  the workload to a container app resource that does not exist).
+#
+# This keeps a single gated artifact: the image that was scanned is byte-for-byte
+# the image that is deployed to both platforms.
+#
+# SECURITY NOTE: --cid is baked into the patched image at patch time and has no
+# runtime override. The patched image is therefore a CID-bearing artifact — the
+# staging repo below holds CID-bearing images and should be treated accordingly.
 
-name: Build and Deploy Falcon Container Apps
+name: Build and Deploy Falcon Container (ACA + App Service)
 
 on:
   workflow_dispatch:
@@ -29,14 +48,19 @@ on:
           - 'clean'
           - 'vulnerability'
           - 'malware'
+      deployTarget:
+        type: choice
+        default: 'both'
+        description: 'Where to deploy the patched image (only if the gate passes)'
+        options:
+          - 'none'
+          - 'aca'
+          - 'appservice'
+          - 'both'
       runFCSScan:
         type: boolean
         default: true
         description: 'Run Falcon Container Security scan on patched image'
-      deployToACA:
-        type: boolean
-        default: true
-        description: 'Deploy patched image to Azure Container Apps (only if gate passes)'
       falconRegion:
         type: choice
         default: 'us-1'
@@ -72,6 +96,9 @@ env:
   IMAGE_REPO: mikedz-falcon-aca
   # Public known-malware test image (nginx-based; WannaCry/Mirai/XMRig samples).
   MALWARE_SOURCE_IMAGE: quay.io/petr_ruzicka/malware-cryptominer-container:3
+  # Logical container name baked in via --container; each deploy job can override
+  # it at runtime with CS_CONTAINER.
+  FALCON_CONTAINER_NAME: mikedz-falcon-workload
 
 jobs:
   build-scan-and-gate:
@@ -85,10 +112,13 @@ jobs:
       # NOTE: passed/exit-code are written by the fcs-summary step (it parses the
       # scan JSON), NOT by the fcs-scan action — wiring these to steps.fcs-scan.*
       # silently yields "" and the deploy gate never matches.
-      # Combined gate: image-assessment policy (vuln/malware) AND IaC secret scan.
       scan-passed: ${{ steps.gate.outputs.passed }}
       scan-exit-code: ${{ steps.fcs-summary.outputs.exit-code }}
       scenario: ${{ steps.vars.outputs.scenario }}
+      # Resolved here (not read from inputs.* in the deploy jobs) so that the
+      # push/schedule triggers — which have no inputs — still get a real target
+      # instead of an empty string that silently matches nothing.
+      deploy-target: ${{ steps.vars.outputs.deploy_target }}
 
     steps:
       - name: Checkout repository
@@ -118,12 +148,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Default scenario/region so push & schedule triggers (no inputs) still work.
+          # Default scenario/target so push & schedule triggers (no inputs) still work.
           SCENARIO="${{ inputs.demoScenario || 'clean' }}"
+          TARGET="${{ inputs.deployTarget || 'aca' }}"
           REGISTRY="${{ vars.ACR_NAME }}.azurecr.io"
           TAG=$(echo "$GITHUB_SHA" | cut -c1-8)
 
           echo "scenario=${SCENARIO}"                                        >> $GITHUB_OUTPUT
+          echo "deploy_target=${TARGET}"                                     >> $GITHUB_OUTPUT
           echo "registry=${REGISTRY}"                                        >> $GITHUB_OUTPUT
           echo "tag=${TAG}"                                                  >> $GITHUB_OUTPUT
           echo "base_image=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}"         >> $GITHUB_OUTPUT
@@ -135,23 +167,7 @@ jobs:
           echo "prod_patched=${REGISTRY}/${{ env.IMAGE_REPO }}:${TAG}-patched" >> $GITHUB_OUTPUT
           echo "sensor_image=${REGISTRY}/falcon-container:${TAG}"            >> $GITHUB_OUTPUT
 
-          echo "### 🎬 Demo scenario: \`${SCENARIO}\`" >> $GITHUB_STEP_SUMMARY
-
-      - name: Set regional configuration
-        id: region-config
-        run: |
-          set -euo pipefail
-          FALCON_REGION="${{ inputs.falconRegion || 'us-1' }}"
-          # VERIFY - API base URLs could not be confirmed via CrowdStrike MCP
-          case "$FALCON_REGION" in
-            "us-1")     API_BASE="https://api.crowdstrike.com" ;;
-            "us-2")     API_BASE="https://api.us-2.crowdstrike.com" ;;
-            "eu-1")     API_BASE="https://api.eu-1.crowdstrike.com" ;;
-            "us-gov-1") API_BASE="https://api.laggar.gcw.crowdstrike.com" ;;
-            "us-gov-2") API_BASE="https://api.alto.gcw.crowdstrike.com" ;;
-            *) echo "::error::Unsupported Falcon region: $FALCON_REGION"; exit 1 ;;
-          esac
-          echo "api-base=${API_BASE}" >> $GITHUB_OUTPUT
+          echo "### 🎬 Demo scenario: \`${SCENARIO}\` — deploy target: \`${TARGET}\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Azure login via OIDC
         uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
@@ -198,7 +214,6 @@ jobs:
             "https://github.com/CrowdStrike/falcon-scripts/releases/download/v1.13.0/falcon-container-sensor-pull.sh"
           chmod +x falcon-pull.sh
 
-          # VERIFY - sensor-pull output format not confirmed via CrowdStrike MCP
           SENSOR_OUTPUT=$(./falcon-pull.sh \
             --client-id "${{ secrets.FALCON_CLIENT_ID }}" \
             --client-secret "${{ secrets.FALCON_CLIENT_SECRET }}" \
@@ -225,9 +240,16 @@ jobs:
           TARGET_IMAGE="${{ steps.vars.outputs.staging_patched }}"
 
           echo "Patching ${BASE_IMAGE} with sensor ${SENSOR_IMAGE} -> ${TARGET_IMAGE} (staging)..."
-          # falconutil injects the sensor and stamps ACA attribution metadata
-          # (--subscription/--resource-group/--cloud-service) into the image.
-          # VERIFY - falconutil flags not confirmed via CrowdStrike MCP
+          # Platform-AGNOSTIC patch: no --cloud-service / --resource-group /
+          # --subscription here. Those are ACA-specific ("This flag is specific to
+          # Azure Container Apps") and each has a runtime CS_* override, so the
+          # deploy jobs stamp attribution per target. One image serves both.
+          #
+          # falconutil sets /opt/CrowdStrike/rootfs/bin/falcon-entrypoint as the
+          # image ENTRYPOINT and chains to the original entrypoint after starting
+          # the sensor. The sensor runs through its own dynamic loader with its own
+          # libc under /opt/CrowdStrike/rootfs/lib64, so the base image's libc is
+          # irrelevant.
           PATCH_OUTPUT=$(docker run --user 0:0 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --rm "${SENSOR_IMAGE}" \
@@ -236,9 +258,7 @@ jobs:
             --target-image-uri "${TARGET_IMAGE}" \
             --falcon-image-uri "${SENSOR_IMAGE}" \
             --image-pull-policy IfNotPresent \
-            --resource-group "${{ vars.RESOURCE_GROUP }}" \
-            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
-            --cloud-service ACA \
+            --container "${{ env.FALCON_CONTAINER_NAME }}" \
             --cid "${{ secrets.FALCON_CID }}")
           echo "$PATCH_OUTPUT"
 
@@ -260,6 +280,7 @@ jobs:
       - name: CrowdStrike Image Scan (policy gate)
         uses: crowdstrike/fcs-action@01930f3d7eb5a9ded52e558abf56452f1bc5b46d # v5.0.3
         id: fcs-scan
+        if: ${{ inputs.runFCSScan == null || inputs.runFCSScan }}
         # Scans the patched image in the STAGING repo (registry assessment). A local
         # (socket) scan returns vulnerabilities/CIS/misconfig but NOT Falcon malware
         # cloud detection — verified on both v2.0.2 and v5.0.3 — so the image must be
@@ -339,18 +360,21 @@ jobs:
           set -euo pipefail
           IMG_EXIT="${{ steps.fcs-summary.outputs.exit-code }}"
           # The image-assessment policy verdict (vulnerability / malware) drives the
-          # gate. exit 0 = passed; non-zero = denied.
+          # gate. exit 0 = passed; non-zero = denied. The IaC scan above is
+          # shift-left visibility only and deliberately does NOT gate.
           if [ "${IMG_EXIT:-0}" = "0" ]; then
             echo "passed=true" >> $GITHUB_OUTPUT
+            echo "reason=image-assessment policy passed (exit 0)" >> $GITHUB_OUTPUT
             echo "Gate PASSED (image-assessment exit ${IMG_EXIT:-0})"
           else
             echo "passed=false" >> $GITHUB_OUTPUT
+            echo "reason=image-assessment policy denied (exit ${IMG_EXIT})" >> $GITHUB_OUTPUT
             echo "Gate DENIED (image-assessment exit ${IMG_EXIT})"
           fi
 
       - name: Gate BLOCKED — delete staging image, fail build
-        # On any gate denial (image policy OR IaC secret) the quarantined image is
-        # removed from staging and the build fails. It is NEVER promoted.
+        # On gate denial the quarantined image is removed from staging and the
+        # build fails. It is NEVER promoted.
         if: ${{ steps.gate.outputs.passed == 'false' }}
         run: |
           set -euo pipefail
@@ -367,6 +391,8 @@ jobs:
       - name: Gate PASSED — promote staging → deployable repo
         # Only a passed image is promoted to the deployable repo/tag. Staging is
         # then cleaned up. The deployable repo only ever holds gated images.
+        # Retag+push preserves the manifest digest, so the image deployed below is
+        # byte-for-byte the image that was scanned.
         if: ${{ steps.gate.outputs.passed == 'true' }}
         run: |
           set -euo pipefail
@@ -379,12 +405,18 @@ jobs:
           echo "Cleaning up staging tag..."
           az acr repository delete --name ${{ vars.ACR_NAME }} --image "${STAGING#*/}" --yes 2>/dev/null || echo "(staging already gone)"
 
-  deploy:
+  # ---------------------------------------------------------------------------
+  # Deploy: Azure Container Apps
+  # ---------------------------------------------------------------------------
+  deploy-aca:
     name: Deploy to Azure Container Apps
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build-scan-and-gate
-    if: ${{ inputs.deployToACA && needs.build-scan-and-gate.outputs.scan-passed == 'true' }}
+    if: >-
+      ${{ needs.build-scan-and-gate.outputs.scan-passed == 'true' &&
+          (needs.build-scan-and-gate.outputs.deploy-target == 'aca' ||
+           needs.build-scan-and-gate.outputs.deploy-target == 'both') }}
     environment: production
 
     steps:
@@ -423,7 +455,13 @@ jobs:
           ACR_SERVER="${{ vars.ACR_NAME }}.azurecr.io"
           IMAGE="${{ needs.build-scan-and-gate.outputs.patched-image-ref }}"
 
-          # Resolve our user-assigned managed identity by its client id.
+          # ACA attribution, applied at RUNTIME (the image itself was patched
+          # platform-agnostically). These override the equivalent patch-time flags.
+          CS_ENV="CS_CLOUD_SERVICE=ACA \
+            CS_AZURE_RESOURCE_GROUP=${RG} \
+            CS_AZURE_SUBSCRIPTION=${{ vars.AZURE_SUBSCRIPTION_ID }} \
+            CS_CONTAINER=${APP}"
+
           UAMI_ID=$(az identity list -g "$RG" \
             --query "[?clientId=='${{ vars.AZURE_CLIENT_ID }}'].id | [0]" -o tsv)
           if [ -z "$UAMI_ID" ]; then
@@ -446,9 +484,14 @@ jobs:
             echo "Updating existing Container App ${APP}..."
             az containerapp registry set -n "$APP" -g "$RG" \
               --server "$ACR_SERVER" --identity "$UAMI_ID" -o none
-            az containerapp update -n "$APP" -g "$RG" --image "$IMAGE" -o none
+            az containerapp update -n "$APP" -g "$RG" --image "$IMAGE" \
+              --set-env-vars $CS_ENV -o none
           else
             echo "Creating Container App ${APP}..."
+            # NOTE: do NOT pass --command here. On ACA --command IS an --entrypoint
+            # override and would replace falcon-entrypoint, silently disabling the
+            # sensor. If a command is ever required, prepend
+            # /opt/CrowdStrike/rootfs/bin/falcon-entrypoint to it.
             az containerapp create -n "$APP" -g "$RG" \
               --environment "$ENV" \
               --image "$IMAGE" \
@@ -456,6 +499,7 @@ jobs:
               --min-replicas 1 --max-replicas 1 \
               --user-assigned "$UAMI_ID" \
               --registry-server "$ACR_SERVER" --registry-identity "$UAMI_ID" \
+              --env-vars $CS_ENV \
               -o none
           fi
 
@@ -463,11 +507,246 @@ jobs:
           echo "fqdn=${FQDN}" >> $GITHUB_OUTPUT
           echo "Deployed. App URL: https://${FQDN}"
 
+      - name: Verify app responds
+        run: |
+          set -euo pipefail
+          FQDN="${{ steps.deploy.outputs.fqdn }}"
+          echo "Probing https://${FQDN}/health ..."
+          for i in $(seq 1 30); do
+            CODE=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "https://${FQDN}/health" 2>/dev/null || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "App responded 200 after $((i*10))s — falcon-entrypoint chained to the app successfully."
+              exit 0
+            fi
+            echo "  attempt ${i}: HTTP ${CODE}; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::App did not return 200 within 300s. If the container is crash-looping, check whether the sensor failed closed."
+          exit 1
+
       - name: Deployment summary
         run: |
-          echo "## 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 ACA Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "- **Scenario:** ${{ needs.build-scan-and-gate.outputs.scenario }} (passed the gate)" >> $GITHUB_STEP_SUMMARY
           echo "- **Image:** \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Container App:** ${{ vars.CONTAINER_APP_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Environment:** ${{ vars.ACA_ENV_NAME }} (${{ steps.ensure-environment.outputs.status }})" >> $GITHUB_STEP_SUMMARY
+          echo "- **Attribution:** \`CS_CLOUD_SERVICE=ACA\` (runtime)" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL:** https://${{ steps.deploy.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Deploy: Azure App Service (Web App for Containers, Linux)
+  # ---------------------------------------------------------------------------
+  # App Service is NOT one of the four platforms with a tailored CrowdStrike
+  # deployment guide (ACA / ACI / ECS_FARGATE / CLOUDRUN). It uses the generic
+  # "Falcon Container Sensor embedded in a container image" path, which CrowdStrike
+  # documents for "other environments that support deployments based on container
+  # images" — with the documented tradeoff that tailored deployments "provide more
+  # container visibility in the Falcon console than this more generic method."
+  #
+  # Why the patched image survives here:
+  #   * App Service APPENDS the Startup Command as the [COMMAND] [ARG...] segment —
+  #     it replaces CMD, not ENTRYPOINT. falcon-entrypoint still runs. (Unlike ACA,
+  #     whose --command genuinely overrides the entrypoint.) We set no startup
+  #     command at all, so the chain is untouched.
+  #   * The sensor ships in /opt via an image layer, and WEBSITES_ENABLE_APP_SERVICE_STORAGE
+  #     only overlays /home — /opt is never masked.
+  #   * You get root in the container and background daemons are supported, which is
+  #     exactly what falcon-entrypoint needs.
+  #   * SYS_PTRACE is required by the ORCHESTRATOR-INJECTION paths (the Fargate
+  #     task-definition patcher, OpenShift SCC), not by patch-image. Cloud Run uses
+  #     patch-image exclusively and also forbids adding capabilities.
+  # ---------------------------------------------------------------------------
+  deploy-appservice:
+    name: Deploy to Azure App Service
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-scan-and-gate
+    if: >-
+      ${{ needs.build-scan-and-gate.outputs.scan-passed == 'true' &&
+          (needs.build-scan-and-gate.outputs.deploy-target == 'appservice' ||
+           needs.build-scan-and-gate.outputs.deploy-target == 'both') }}
+    environment: production
+
+    steps:
+      - name: Azure login via OIDC
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Enable ACR ARM-audience authentication
+        # Required for managed-identity pulls. Without this, App Service pulls fail
+        # with: UNAUTHORIZED "token validation failed". Idempotent.
+        run: |
+          set -euo pipefail
+          az acr config authentication-as-arm update \
+            --registry ${{ vars.ACR_NAME }} --status enabled -o none
+          echo "ACR ARM-audience auth enabled on ${{ vars.ACR_NAME }}"
+
+      - name: Ensure Linux App Service plan exists
+        id: ensure-plan
+        run: |
+          set -euo pipefail
+          RG="${{ vars.RESOURCE_GROUP }}"
+          PLAN="${{ vars.APP_SERVICE_PLAN }}"
+          LOCATION="${{ vars.AZURE_LOCATION }}"
+          if az appservice plan show -n "$PLAN" -g "$RG" --query name -o tsv 2>/dev/null; then
+            echo "Plan '${PLAN}' already exists"; echo "status=exists" >> $GITHUB_OUTPUT
+          else
+            echo "Creating Linux plan '${PLAN}' (B1)..."
+            az appservice plan create -n "$PLAN" -g "$RG" --location "$LOCATION" \
+              --is-linux --sku B1 -o none
+            echo "status=created" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to Azure App Service
+        id: deploy
+        run: |
+          set -euo pipefail
+          RG="${{ vars.RESOURCE_GROUP }}"
+          APP="${{ vars.APP_SERVICE_NAME }}"
+          PLAN="${{ vars.APP_SERVICE_PLAN }}"
+          ACR_SERVER="${{ vars.ACR_NAME }}.azurecr.io"
+          IMAGE="${{ needs.build-scan-and-gate.outputs.patched-image-ref }}"
+          CLIENT_ID="${{ vars.AZURE_CLIENT_ID }}"
+
+          UAMI_ID=$(az identity list -g "$RG" \
+            --query "[?clientId=='${CLIENT_ID}'].id | [0]" -o tsv)
+          if [ -z "$UAMI_ID" ]; then
+            echo "::error::Could not resolve user-assigned identity (clientId=${CLIENT_ID}) in ${RG}"; exit 1
+          fi
+          echo "Using managed identity: $UAMI_ID"
+
+          if az webapp show -n "$APP" -g "$RG" >/dev/null 2>&1; then
+            echo "Web app ${APP} exists — updating container image..."
+          else
+            echo "Creating web app ${APP}..."
+            az webapp create -n "$APP" -g "$RG" --plan "$PLAN" \
+              --container-image-name "$IMAGE" -o none
+          fi
+
+          # Attach the user-assigned identity and point ACR pull at it.
+          az webapp identity assign -n "$APP" -g "$RG" --identities "$UAMI_ID" -o none
+          az webapp config set -n "$APP" -g "$RG" \
+            --generic-configurations "{\"acrUseManagedIdentityCreds\": true, \"acrUserManagedIdentityID\": \"${CLIENT_ID}\"}" -o none
+
+          # Point at the gated image. NOTE: no --startup-file is set anywhere. On
+          # App Service the startup command is appended as CMD (it does not replace
+          # ENTRYPOINT), but leaving it empty keeps the falcon-entrypoint -> app
+          # chain exactly as falconutil built it.
+          az webapp config container set -n "$APP" -g "$RG" \
+            --container-image-name "$IMAGE" \
+            --container-registry-url "https://${ACR_SERVER}" -o none
+
+          # App settings become container env vars.
+          #   WEBSITES_PORT ................ port App Service HTTP-pings and routes to
+          #   WEBSITES_CONTAINER_START_TIME_LIMIT ... default is 230s; the sensor adds
+          #     startup latency before the app binds, so raise it (max 1800)
+          #   CS_APP_NAME / CS_CONTAINER ... platform-agnostic Falcon attribution
+          # CS_CLOUD_SERVICE is deliberately NOT set: there is no App Service enum,
+          # and stamping ACA would attribute this to a nonexistent container app.
+          az webapp config appsettings set -n "$APP" -g "$RG" --settings \
+            WEBSITES_PORT=80 \
+            WEBSITES_CONTAINER_START_TIME_LIMIT=600 \
+            WEBSITES_ENABLE_APP_SERVICE_STORAGE=false \
+            CS_APP_NAME="falcon-appservice-demo" \
+            CS_CONTAINER="${APP}" \
+            -o none
+
+          az webapp restart -n "$APP" -g "$RG" -o none
+
+          FQDN=$(az webapp show -n "$APP" -g "$RG" --query defaultHostName -o tsv)
+          echo "fqdn=${FQDN}" >> $GITHUB_OUTPUT
+          echo "Deployed. App URL: https://${FQDN}"
+
+      - name: Verify app responds (sensor did not fail closed)
+        id: probe
+        # This is the load-bearing test. App Service health-pings the container and
+        # restart-loops it if nothing binds the port. A 200 here proves
+        # falcon-entrypoint started the sensor AND chained to the app — i.e. the
+        # sensor did not fail closed inside the App Service sandbox.
+        run: |
+          set -euo pipefail
+          FQDN="${{ steps.deploy.outputs.fqdn }}"
+          echo "Probing https://${FQDN}/health ..."
+          for i in $(seq 1 45); do
+            CODE=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "https://${FQDN}/health" 2>/dev/null || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "App responded 200 after $((i*10))s."
+              echo "result=pass" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "  attempt ${i}: HTTP ${CODE}; retrying in 10s..."
+            sleep 10
+          done
+          echo "result=fail" >> $GITHUB_OUTPUT
+          echo "::error::App did not return 200 within 450s. Pull the container logs below to see whether falcon-entrypoint or the app is at fault."
+          exit 1
+
+      - name: Container logs (sensor startup evidence)
+        if: always()
+        continue-on-error: true
+        # Docker/container logs include the entrypoint chain, so this is where
+        # falcon-entrypoint output and any sensor startup failure will surface.
+        run: |
+          set +e
+          RG="${{ vars.RESOURCE_GROUP }}"; APP="${{ vars.APP_SERVICE_NAME }}"
+          echo "Downloading container logs for ${APP}..."
+          az webapp log download -n "$APP" -g "$RG" --log-file appservice-logs.zip 2>/dev/null
+          if [ -f appservice-logs.zip ]; then
+            mkdir -p appservice-logs && unzip -o -q appservice-logs.zip -d appservice-logs
+            echo "--- lines mentioning falcon / CrowdStrike / entrypoint ---"
+            grep -rhiE "falcon|crowdstrike|entrypoint" appservice-logs | tail -50
+          else
+            echo "(no logs retrieved; enable logging with: az webapp log config -n $APP -g $RG --docker-container-logging filesystem)"
+          fi
+          true
+
+      - name: Verify Falcon sensor got an AID (best effort)
+        if: always()
+        continue-on-error: true
+        # Documented verification is `falconctl -g --aid` inside the container. On
+        # App Service the Kudu /api/command endpoint is the only non-interactive way
+        # in, and it requires SSH support in the image — this demo image has none, so
+        # treat a failure here as inconclusive, NOT as a sensor failure. Confirm in
+        # the Falcon console instead.
+        #
+        # CAUTION: the sensor self-defends by terminating processes that read its
+        # /proc entries, and the documented opt-out is a Kubernetes annotation with
+        # no embedded-mode equivalent. Prefer falconctl over `ps`-style enumeration.
+        run: |
+          set +e
+          RG="${{ vars.RESOURCE_GROUP }}"; APP="${{ vars.APP_SERVICE_NAME }}"
+          CREDS=$(az webapp deployment list-publishing-credentials -n "$APP" -g "$RG" \
+            --query "{u:publishingUserName,p:publishingPassword}" -o json 2>/dev/null)
+          USER=$(echo "$CREDS" | jq -r .u); PASS=$(echo "$CREDS" | jq -r .p)
+          if [ -z "$USER" ] || [ "$USER" = "null" ]; then
+            echo "::warning::Could not get Kudu credentials; skipping in-container AID check."
+            exit 0
+          fi
+          RESP=$(curl -sS -u "$USER:$PASS" -X POST \
+            -H 'Content-Type: application/json' \
+            --max-time 60 \
+            -d '{"command":"/opt/CrowdStrike/rootfs/bin/falconctl -g --aid","dir":"/"}' \
+            "https://${APP}.scm.azurewebsites.net/api/command" 2>/dev/null)
+          echo "Kudu response: ${RESP}"
+          if echo "$RESP" | grep -qiE "aid=?[0-9a-f]{32}"; then
+            echo "✅ Sensor reported an AID — it registered with the CrowdStrike cloud."
+          else
+            echo "::warning::No AID parsed. Inconclusive (Kudu exec needs SSH support in the image). Verify in the Falcon console: Cloud security > Assets > Kubernetes and containers inventory > Containers, filtered on CS_APP_NAME=falcon-appservice-demo."
+          fi
+          true
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## 🚀 App Service Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Scenario:** ${{ needs.build-scan-and-gate.outputs.scenario }} (passed the gate)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ needs.build-scan-and-gate.outputs.patched-image-ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Web App:** ${{ vars.APP_SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Plan:** ${{ vars.APP_SERVICE_PLAN }} (${{ steps.ensure-plan.outputs.status }})" >> $GITHUB_STEP_SUMMARY
+          echo "- **HTTP probe:** ${{ steps.probe.outputs.result || 'fail' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Attribution:** \`CS_APP_NAME\` + \`CS_CONTAINER\` (generic embedded path; \`CS_CLOUD_SERVICE\` intentionally unset)" >> $GITHUB_STEP_SUMMARY
           echo "- **URL:** https://${{ steps.deploy.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
