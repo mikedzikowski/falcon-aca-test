@@ -11,6 +11,7 @@
 #   clean         -> healthy app            -> gate PASSES  -> deploys
 #   vulnerability -> aiohttp==3.9.1          -> CVE-2024-23334 -> gate BLOCKS
 #   malware       -> pull known-malware img  -> malware detection -> gate BLOCKS
+#   supplychain   -> compromised npm pkgs    -> CompromisedPackage -> gate BLOCKS
 #
 # The gate itself lives in the Falcon console (image-assessment policy
 # "mikedz-aca-demo-gate", scoped to this repo). The fcs-action image-scan exit
@@ -52,6 +53,7 @@ on:
           - 'clean'
           - 'vulnerability'
           - 'malware'
+          - 'supplychain'
       deployTarget:
         type: choice
         default: 'all'
@@ -214,6 +216,12 @@ jobs:
             echo "Pulling known-malware test image: ${MALWARE_SOURCE_IMAGE}"
             docker pull "${MALWARE_SOURCE_IMAGE}"
             docker tag "${MALWARE_SOURCE_IMAGE}" "${BASE_IMAGE}"
+          elif [ "$SCENARIO" = "supplychain" ]; then
+            # Separate Dockerfile: the fixture is alpine-based with npm manifests,
+            # not the python:3.12-slim app, so it cannot be a SCENARIO branch of the
+            # main Dockerfile without a conditional FROM.
+            echo "Building supply-chain fixture from Dockerfile.supplychain (local only)..."
+            docker build -f Dockerfile.supplychain -t "${BASE_IMAGE}" .
           else
             echo "Building scenario '${SCENARIO}' from Dockerfile (local only)..."
             docker build --build-arg "SCENARIO=${SCENARIO}" -t "${BASE_IMAGE}" .
@@ -352,6 +360,27 @@ jobs:
             echo "" >> "$SUMMARY"
             echo "**Policy:** $POLICY_NAME &nbsp;|&nbsp; **Denied:** \`$POLICY_DENY\`" >> "$SUMMARY"
             echo "" >> "$SUMMARY"
+
+            # Compromised-package (supply chain) findings. FCS reports these as
+            # detection_type=CompromisedPackage / detection_name=CompromisedNPMPackage,
+            # with each offending package in the detection details. Surfaced here so
+            # the supplychain scenario shows WHICH package tripped the gate rather
+            # than just a non-zero exit code.
+            CP=$(jq -r '
+              [ .. | objects
+                | select((.detection_type? // "") == "CompromisedPackage"
+                      or (.DetectionType?  // "") == "CompromisedPackage") ]
+              | length' scan-image.json 2>/dev/null || echo 0)
+            if [ "${CP:-0}" != "0" ]; then
+              echo "### 🔗 Supply chain — compromised packages" >> "$SUMMARY"; echo "" >> "$SUMMARY"
+              jq -r '
+                [ .. | objects
+                  | select((.detection_type? // "") == "CompromisedPackage"
+                        or (.DetectionType?  // "") == "CompromisedPackage") ]
+                | .[] | (.details? // .Details? // [])[]?' scan-image.json 2>/dev/null \
+                | sed 's/^/- /' | sort -u >> "$SUMMARY" || true
+              echo "" >> "$SUMMARY"
+            fi
           fi
 
           cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
@@ -382,6 +411,16 @@ jobs:
             echo "passed=true" >> $GITHUB_OUTPUT
             echo "reason=image-assessment policy passed (exit 0)" >> $GITHUB_OUTPUT
             echo "Gate PASSED (image-assessment exit ${IMG_EXIT:-0})"
+            # A scenario that is SUPPOSED to be blocked but passed means the policy
+            # rule is not matching — the demo would look fine while proving nothing.
+            # Most likely cause is a detection_type value that does not match the
+            # tenant's canonical casing (the real values are Malware, Secret,
+            # CompromisedPackage, Malicious, SuspiciousFile, CIS, Misconfiguration).
+            case "${{ steps.vars.outputs.scenario }}" in
+              vulnerability|malware|supplychain)
+                echo "::warning::Scenario '${{ steps.vars.outputs.scenario }}' is expected to be BLOCKED but the gate passed. The image-assessment policy rule is probably not matching this detection type — verify the policy's detection_type / cve_id values before trusting this result."
+                ;;
+            esac
           else
             echo "passed=false" >> $GITHUB_OUTPUT
             echo "reason=image-assessment policy denied (exit ${IMG_EXIT})" >> $GITHUB_OUTPUT

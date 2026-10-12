@@ -1,0 +1,63 @@
+# Test fixture for validating the "Supply chain" image assessment policy rule.
+#
+# Contains npm package manifests for versions from real, publicly documented
+# supply chain compromises. The manifests are written directly rather than
+# installed via npm, for two reasons:
+#   1. These malicious versions were unpublished from the registry, so
+#      `npm install` 404s on most of them.
+#   2. It pins exactly which name@version pairs appear in the inventory, so a
+#      detection points at one package instead of a transitive dependency tree.
+#
+# FCS inventories npm components by reading node_modules/*/package.json, so a
+# written manifest produces the same SBOM entry as a real install.
+#
+# VERIFIED against the live tenant: FCS raises detection_name=CompromisedNPMPackage
+# (detection_type=CompromisedPackage, severity=critical) for these, and matches on
+# manifest CONTENTS rather than directory name. Of the set below, these are
+# confirmed present in CrowdStrike's compromised-package feed today:
+#   @ctrl/tinycolor@4.1.1, chalk@5.6.1, debug@4.4.2
+# The older entries (2018-2022) may or may not fire; they are kept for breadth and
+# because feed coverage changes over time. Three confirmed hits are enough for the
+# gate to block, so the scenario does not depend on any single package.
+FROM alpine:3.20
+WORKDIR /app
+# name@version pairs from documented npm supply chain compromises:
+#   event-stream 3.3.6 / flatmap-stream 0.1.1  Nov 2018, Copay wallet backdoor
+#   ua-parser-js 0.7.29                        Oct 2021, cryptominer + stealer
+#   coa 2.0.3 / rc 1.2.9                       Nov 2021, account takeover
+#   node-ipc 10.1.1                            Mar 2022, file-wiping protestware
+#   @ctrl/tinycolor 4.1.1                      Sep 2025, Shai-Hulud worm
+#   chalk 5.6.1 / debug 4.4.2                  Sep 2025, crypto-clipper payload
+ARG COMPROMISED="\
+event-stream@3.3.6 \
+flatmap-stream@0.1.1 \
+ua-parser-js@0.7.29 \
+coa@2.0.3 \
+rc@1.2.9 \
+node-ipc@10.1.1 \
+@ctrl/tinycolor@4.1.1 \
+chalk@5.6.1 \
+debug@4.4.2"
+# Current, uncompromised release. Control: if this is flagged too, the rule is
+# matching on package name rather than name+version.
+ARG CLEAN="lodash@4.17.21"
+RUN for spec in $COMPROMISED $CLEAN; do \
+      name="${spec%@*}"; \
+      version="${spec##*@}"; \
+      mkdir -p "node_modules/$name"; \
+      printf '{"name":"%s","version":"%s","license":"MIT"}\n' \
+        "$name" "$version" > "node_modules/$name/package.json"; \
+    done
+# Root manifest declaring the same set, for scanners that read it directly.
+RUN { \
+      printf '{\n  "name": "supply-chain-policy-test",\n'; \
+      printf '  "version": "1.0.0",\n  "dependencies": {\n'; \
+      first=1; \
+      for spec in $COMPROMISED $CLEAN; do \
+        name="${spec%@*}"; version="${spec##*@}"; \
+        [ $first -eq 1 ] || printf ',\n'; first=0; \
+        printf '    "%s": "%s"' "$name" "$version"; \
+      done; \
+      printf '\n  }\n}\n'; \
+    } > package.json
+CMD ["sh", "-c", "echo 'Supply chain policy test fixture'; cat package.json"]
