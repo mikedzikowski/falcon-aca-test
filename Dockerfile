@@ -30,5 +30,14 @@ RUN set -eux; \
         pip install --no-cache-dir "aiohttp==3.10.11"; \
     fi
 
+# Build identity, so the deploy jobs can prove the NEW image is what is serving
+# (a 200 alone can come from the previous revision/container). Declared after the
+# pip layer so a per-run value doesn't bust the dependency cache. Baked here —
+# before falconutil patch-image, which builds FROM this image and keeps its ENV
+# and filesystem — so it is part of the scanned, digest-identical artifact.
+ARG BUILD_ID=unset
+ENV BUILD_ID=${BUILD_ID}
+RUN printf '%s\n' "${BUILD_ID}" > /app/BUILD_ID
+
 EXPOSE 80
 CMD ["python", "/app/app.py"]

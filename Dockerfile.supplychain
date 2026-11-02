@@ -11,14 +11,18 @@
 # FCS inventories npm components by reading node_modules/*/package.json, so a
 # written manifest produces the same SBOM entry as a real install.
 #
-# VERIFIED against the live tenant: FCS raises detection_name=CompromisedNPMPackage
-# (detection_type=CompromisedPackage, severity=critical) for these, and matches on
-# manifest CONTENTS rather than directory name. Of the set below, these are
-# confirmed present in CrowdStrike's compromised-package feed today:
+# VERIFIED against the live tenant: FCS matches on manifest CONTENTS rather than
+# directory name, and flags these three (severity=critical):
 #   @ctrl/tinycolor@4.1.1, chalk@5.6.1, debug@4.4.2
-# The older entries (2018-2022) may or may not fire; they are kept for breadth and
-# because feed coverage changes over time. Three confirmed hits are enough for the
-# gate to block, so the scenario does not depend on any single package.
+# The detection TYPE is not stable over time: on 2026-10-20 each produced both
+# Type=CompromisedPackage/Name=CompromisedNPMPackage and
+# Type=Malicious/Name=KnownCompromisedNPMPackage; by 2026-10-30 only the Malicious
+# ones were emitted. The gate therefore has to match BOTH types (policy block rule
+# detection_type in [Malicious, CompromisedPackage], and the workflow's detection
+# guard does the same) — the scenario depends on that, not on how many packages
+# are listed.
+# The older entries (2018-2022) have never fired on this tenant; they are kept as
+# labelled breadth in case feed coverage changes.
 FROM alpine:3.20
 WORKDIR /app
 # name@version pairs from documented npm supply chain compromises:
