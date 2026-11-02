@@ -290,7 +290,13 @@ jobs:
           echo "Sensor image: $SENSOR_IMAGE"
 
           docker tag "$SENSOR_IMAGE" "${{ steps.vars.outputs.sensor_image }}"
-          docker push "${{ steps.vars.outputs.sensor_image }}"
+          # Retried for the same reason as the staging push below (parallel runs).
+          for attempt in 1 2 3 4; do
+            docker push "${{ steps.vars.outputs.sensor_image }}" && break
+            [ "$attempt" = 4 ] && { echo "::error::docker push failed after 4 attempts"; exit 1; }
+            echo "::warning::docker push attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
 
       - name: Patch image with Falcon sensor, publish to STAGING
         id: patch-image
@@ -325,8 +331,16 @@ jobs:
           # registry assessment (malware cloud detection does not run on a local-only
           # scan). This is a quarantine location — the deployable repo is untouched
           # until the gate passes and we promote.
+          # Retried: when scenarios run in parallel they all upload the same sensor
+          # layer at the same moment, and ACR fails the colliding blob uploads with
+          # "unexpected EOF". A push is idempotent, so a retry just finishes it.
           echo "Publishing patched image to staging: ${TARGET_IMAGE}"
-          docker push "${TARGET_IMAGE}"
+          for attempt in 1 2 3 4; do
+            docker push "${TARGET_IMAGE}" && break
+            [ "$attempt" = 4 ] && { echo "::error::docker push failed after 4 attempts"; exit 1; }
+            echo "::warning::docker push attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
 
           # Registry manifest digest (NOT the local image id falconutil prints).
           DIGEST=$(az acr repository show --name "$ACR_NAME" --image "${TARGET_IMAGE#*/}" --query digest -o tsv)
@@ -585,7 +599,12 @@ jobs:
           PROD="${{ steps.vars.outputs.prod_patched }}"
           echo "Gate passed — promoting ${STAGING} -> ${PROD}"
           docker tag "${STAGING}" "${PROD}"
-          docker push "${PROD}"
+          for attempt in 1 2 3 4; do
+            docker push "${PROD}" && break
+            [ "$attempt" = 4 ] && { echo "::error::docker push failed after 4 attempts"; exit 1; }
+            echo "::warning::docker push attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
           PROD_DIGEST=$(az acr repository show --name "$ACR_NAME" --image "${PROD#*/}" --query digest -o tsv)
           if [ "$PROD_DIGEST" != "${{ steps.patch-image.outputs.digest }}" ]; then
             echo "::error::Promoted digest ${PROD_DIGEST} != scanned digest ${{ steps.patch-image.outputs.digest }}"; exit 1
